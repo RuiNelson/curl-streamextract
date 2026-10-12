@@ -1991,17 +1991,37 @@ static CURLcode ssh_state_sftp_quote_mkdir(struct Curl_easy *data,
 static CURLcode ssh_state_sftp_quote_rename(struct Curl_easy *data,
                                             struct ssh_conn *sshc)
 {
-  int rc =
-    libssh2_sftp_rename_ex(sshc->sftp_session, sshc->quote_path1,
-                           curlx_uztoui(strlen(sshc->quote_path1)),
-                           sshc->quote_path2,
-                           curlx_uztoui(strlen(sshc->quote_path2)),
-                           LIBSSH2_SFTP_RENAME_OVERWRITE |
-                           LIBSSH2_SFTP_RENAME_ATOMIC |
-                           LIBSSH2_SFTP_RENAME_NATIVE);
-
+  int rc = 0;
+#if LIBSSH2_VERSION_NUM >= 0x010b01 /* libssh2_sftp_posix_rename_ex() */
+  if(!sshc->sftp_rename_fallback) {
+    rc = libssh2_sftp_posix_rename_ex(sshc->sftp_session, sshc->quote_path1,
+                                     strlen(sshc->quote_path1),
+                                     sshc->quote_path2,
+                                     strlen(sshc->quote_path2));
+    if(rc == LIBSSH2_ERROR_EAGAIN)
+      return CURLE_AGAIN;
+    if(rc == (int)LIBSSH2_FX_OP_UNSUPPORTED ||
+       (rc == LIBSSH2_ERROR_SFTP_PROTOCOL &&
+        libssh2_sftp_last_error(sshc->sftp_session) ==
+        LIBSSH2_FX_OP_UNSUPPORTED))
+      /* the server lacks posix-rename@openssh.com */
+      sshc->sftp_rename_fallback = TRUE;
+  }
+#else
+  sshc->sftp_rename_fallback = TRUE;
+#endif
+  if(sshc->sftp_rename_fallback) {
+    rc = libssh2_sftp_rename_ex(sshc->sftp_session, sshc->quote_path1,
+                               curlx_uztoui(strlen(sshc->quote_path1)),
+                               sshc->quote_path2,
+                               curlx_uztoui(strlen(sshc->quote_path2)),
+                               LIBSSH2_SFTP_RENAME_OVERWRITE |
+                               LIBSSH2_SFTP_RENAME_ATOMIC |
+                               LIBSSH2_SFTP_RENAME_NATIVE);
+  }
   if(rc == LIBSSH2_ERROR_EAGAIN)
     return CURLE_AGAIN;
+  sshc->sftp_rename_fallback = FALSE;
 
   if(rc && !sshc->acceptfail) {
     unsigned long sftperr = libssh2_sftp_last_error(sshc->sftp_session);

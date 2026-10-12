@@ -214,6 +214,7 @@ struct ssh_conn {
   LIBSSH2_KNOWNHOSTS *kh;
 #endif /* USE_LIBSSH */
   BIT(authed);                /* the connection has been authenticated fine */
+  BIT(sftp_rename_fallback); /* posix-rename unsupported, use plain rename */
   BIT(acceptfail);            /* used by the SFTP_QUOTE (continue if
                                  quote command fails) */
 };
