@@ -1002,12 +1002,10 @@ static ParameterError set_data(cmdline_t cmd,
   if(cmd == C_JSON)
     config->jsoned = TRUE;
 
-  if(curlx_dyn_len(&config->postdata)) {
-    /* skip separator append for --json */
-    if(!err && (cmd != C_JSON) &&
-       curlx_dyn_addn(&config->postdata, "&", 1))
-      err = PARAM_NO_MEM;
-  }
+  /* skip separator append for --json */
+  if(curlx_dyn_len(&config->postdata) && !err && (cmd != C_JSON) &&
+     curlx_dyn_addn(&config->postdata, "&", 1))
+    err = PARAM_NO_MEM;
 
   if(!err && curlx_dyn_addn(&config->postdata, postdata, size))
     err = PARAM_NO_MEM;
@@ -2155,6 +2153,7 @@ static ParameterError opt_bool(struct OperationConfig *config,
     break;
   case C_REMOTE_HEADER_NAME: /* --remote-header-name */
     config->content_disposition = toggle;
+    config->suppress_connect_headers = toggle;
     break;
   case C_INSECURE: /* --insecure */
     config->insecure_ok = toggle;
@@ -2816,10 +2815,8 @@ static ParameterError opt_string(struct OperationConfig *config,
     break;
   case C_HOSTPUBMD5: /* --hostpubmd5 */
     err = getstr(&config->hostpubmd5, nextarg, DENY_BLANK);
-    if(!err) {
-      if(!config->hostpubmd5 || strlen(config->hostpubmd5) != 32)
-        err = PARAM_BAD_USE;
-    }
+    if(!err && (!config->hostpubmd5 || strlen(config->hostpubmd5) != 32))
+      err = PARAM_BAD_USE;
     break;
   case C_HOSTPUBSHA256: /* --hostpubsha256 */
     err = getstr(&config->hostpubsha256, nextarg, DENY_BLANK);
@@ -3070,8 +3067,12 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
       }
 
       if(has_leading_unicode((const unsigned char *)nextarg)) {
-        warnf("The argument '%s' starts with a Unicode character. "
-              "Maybe ASCII was intended?", nextarg);
+        if(a->desc & ARG_CLEAR)
+          warnf("The argument to --%s starts with a Unicode character. "
+                "Maybe ASCII was intended?", a->lname);
+        else
+          warnf("The argument '%s' starts with a Unicode character. "
+                "Maybe ASCII was intended?", nextarg);
       }
       switch(ARGTYPE(a->desc)) {
       case ARG_FILE:
@@ -3193,10 +3194,8 @@ ParameterError parse_args(int argc, argv_item_t argv[])
     }
   }
 
-  if(!err && config->content_disposition) {
-    if(config->resume_from_current)
-      err = PARAM_CONTDISP_RESUME_FROM;
-  }
+  if(!err && config->content_disposition && config->resume_from_current)
+    err = PARAM_CONTDISP_RESUME_FROM;
 
   if(err &&
      err != PARAM_HELP_REQUESTED &&
