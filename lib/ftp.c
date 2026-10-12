@@ -100,6 +100,8 @@ static const char * const ftp_state_names[] = {
   "PWD",
   "SYST",
   "NAMEFMT",
+  "MODE",
+  "MODE_XFER",
   "QUOTE",
   "RETR_PREQUOTE",
   "STOR_PREQUOTE",
@@ -351,9 +353,482 @@ static int ftp_need_type(struct ftp_conn *ftpc,
 static void close_secondarysocket(struct Curl_easy *data,
                                   struct ftp_conn *ftpc)
 {
-  (void)ftpc;
   CURL_TRC_FTP(data, "[%s] closing DATA connection", FTP_CSTATE(ftpc));
   Curl_conn_cf_discard_all(data, data->conn, SECONDARYSOCKET);
+  ftpc->blk_kept = FALSE;
+}
+
+/***********************************************************************
+ *
+ * Block mode (MODE B, RFC 959 section 3.4.2)
+ *
+ * In block mode the data connection carries blocks made of a 3-byte header
+ * (a descriptor and a 16-bit big-endian payload length) followed by the
+ * payload. End of file is a flag in the descriptor instead of the closing of
+ * the connection, so the data connection can stay open and be reused by the
+ * next transfer on the same control connection.
+ *
+ * The framing is done by a connection filter put on top of the
+ * SECONDARYSOCKET filter chain. Towards the transfer it only deals in payload
+ * bytes, so all byte counts, size checks and progress exclude the block
+ * headers. A received end of file block is reported as the end of the stream
+ * (a zero length receive) without waiting for the connection to close, and
+ * nothing beyond it is read. When sending, the payload is framed and an end
+ * of file block is added after the last byte, instead of the transfer
+ * shutting down the connection.
+ */
+#define FTP_BLK_DESC_EOF     0x40 /* end of file */
+#define FTP_BLK_DESC_RESTART 0x10 /* restart marker, payload is no data */
+#define FTP_BLK_DESC_INVALID 0x0f /* bits no descriptor may have */
+#define FTP_BLK_HDR_LEN      3
+#define FTP_BLK_MAX          65535 /* largest payload of a block */
+/* Payload sent in the same buffer as a block header or the end of file
+   block, so that small files need a single send */
+#define FTP_BLK_COALESCE     (16 * 1024)
+
+static const unsigned char ftp_blk_eof[FTP_BLK_HDR_LEN] = {
+  FTP_BLK_DESC_EOF, 0, 0
+};
+
+struct cf_ftp_blk_ctx {
+  unsigned char *scratch;    /* buffer to send headers with payload */
+  size_t iblk_left;          /* payload left in the block being received */
+  size_t oblk_left;          /* payload left in the block being sent */
+  unsigned char ihdr[FTP_BLK_HDR_LEN]; /* header being received */
+  unsigned char ohdr[FTP_BLK_HDR_LEN]; /* header of the block being sent */
+  unsigned char idesc;       /* descriptor of the block being received */
+  unsigned char ihdr_len;    /* bytes in ihdr */
+  unsigned char ohdr_left;   /* bytes of ohdr not sent yet */
+  unsigned char otrl_left;   /* bytes of the end of file block not sent */
+  BIT(recv_eof);       /* end of file block received */
+  BIT(recv_eof_told);  /* end of file reported to the transfer */
+  BIT(send_eof);       /* end of file block committed (maybe not sent) */
+  BIT(failed);         /* truncated or invalid data, unusable */
+};
+
+/* Get ready for a new transfer on the (kept) data connection */
+static void cf_ftp_blk_reset(struct cf_ftp_blk_ctx *ctx)
+{
+  unsigned char *scratch = ctx->scratch;
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->scratch = scratch;
+}
+
+static void cf_ftp_blk_destroy(struct Curl_cfilter *cf,
+                               struct Curl_easy *data)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  (void)data;
+  if(ctx) {
+    curlx_free(ctx->scratch);
+    curlx_free(ctx);
+  }
+}
+
+static CURLcode cf_ftp_blk_truncated(struct Curl_cfilter *cf,
+                                     struct Curl_easy *data)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  failf(data, "FTP block mode: data connection closed before the end of "
+        "file");
+  ctx->failed = TRUE;
+  return CURLE_PARTIAL_FILE;
+}
+
+static CURLcode cf_ftp_blk_recv(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                char *buf, size_t len, size_t *pnread)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  CURLcode result;
+  size_t n;
+
+  *pnread = 0;
+  if(ctx->failed)
+    return CURLE_RECV_ERROR;
+  if(!len)
+    return CURLE_AGAIN;
+
+  for(;;) {
+    if(ctx->iblk_left) {
+      result = Curl_conn_cf_recv(cf->next, data, buf,
+                                 CURLMIN(len, ctx->iblk_left), &n);
+      if(result)
+        return result;
+      if(!n)
+        return cf_ftp_blk_truncated(cf, data);
+      ctx->iblk_left -= n;
+      if(!ctx->iblk_left && (ctx->idesc & FTP_BLK_DESC_EOF))
+        ctx->recv_eof = TRUE;
+      if(ctx->idesc & FTP_BLK_DESC_RESTART)
+        continue; /* a restart marker is no file data, discard it */
+      *pnread = n;
+      return CURLE_OK;
+    }
+
+    if(ctx->recv_eof) {
+      /* end of file: report the end of the stream, read nothing more */
+      ctx->recv_eof_told = TRUE;
+      return CURLE_OK;
+    }
+
+    /* read the (rest of the) next block header, never more than that */
+    result = Curl_conn_cf_recv(cf->next, data,
+                               (char *)&ctx->ihdr[ctx->ihdr_len],
+                               FTP_BLK_HDR_LEN - ctx->ihdr_len, &n);
+    if(result)
+      return result;
+    if(!n)
+      return cf_ftp_blk_truncated(cf, data);
+    ctx->ihdr_len = (unsigned char)(ctx->ihdr_len + n);
+    if(ctx->ihdr_len < FTP_BLK_HDR_LEN)
+      continue;
+
+    ctx->ihdr_len = 0;
+    ctx->idesc = ctx->ihdr[0];
+    ctx->iblk_left = ((size_t)ctx->ihdr[1] << 8) | ctx->ihdr[2];
+    CURL_TRC_CF(data, cf, "recv block, descriptor 0x%02x, %zu bytes",
+                ctx->idesc, ctx->iblk_left);
+    if(ctx->idesc & FTP_BLK_DESC_INVALID) {
+      failf(data, "FTP block mode: invalid block descriptor 0x%02x",
+            ctx->idesc);
+      ctx->failed = TRUE;
+      return CURLE_WEIRD_SERVER_REPLY;
+    }
+    if(!ctx->iblk_left && (ctx->idesc & FTP_BLK_DESC_EOF))
+      ctx->recv_eof = TRUE;
+    /* zero length blocks without end of file are legal: next header */
+  }
+}
+
+/*
+ * Send payload as blocks. Lower filters (TLS) may require a send they
+ * rejected with CURLE_AGAIN to be repeated with the same, or more, bytes.
+ * The bytes sent below depend only on the state here and on the payload
+ * offered by the caller, who repeats the bytes not accepted, so a repeated
+ * send starts with the same bytes and is at least as long.
+ */
+static CURLcode cf_ftp_blk_send(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                const uint8_t *buf, size_t len, bool eos,
+                                size_t *pnwritten)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  CURLcode result = CURLE_OK;
+  size_t done = 0; /* payload bytes accepted */
+
+  *pnwritten = 0;
+  if(ctx->failed)
+    return CURLE_SEND_ERROR;
+  if(ctx->send_eof && !ctx->oblk_left && len) {
+    DEBUGASSERT(0); /* data after the end of file */
+    return CURLE_SEND_ERROR;
+  }
+
+  for(;;) {
+    const uint8_t *pay = buf + done;
+    size_t hlen, plen, tlen, offered, accepted, nw = 0, n;
+
+    if(!ctx->oblk_left && !ctx->send_eof && (done < len)) {
+      /* start a new block */
+      size_t blen = CURLMIN(len - done, FTP_BLK_MAX);
+      ctx->ohdr[0] = 0;
+      ctx->ohdr[1] = (unsigned char)(blen >> 8);
+      ctx->ohdr[2] = (unsigned char)(blen & 0xff);
+      ctx->ohdr_left = FTP_BLK_HDR_LEN;
+      ctx->oblk_left = blen;
+    }
+    hlen = ctx->ohdr_left;
+    plen = CURLMIN(len - done, ctx->oblk_left);
+    if(eos && !ctx->send_eof && (done + plen == len) &&
+       (plen == ctx->oblk_left)) {
+      /* the payload ends with this block, the end of file block follows */
+      ctx->send_eof = TRUE;
+      ctx->otrl_left = FTP_BLK_HDR_LEN;
+    }
+    tlen = (ctx->send_eof && (plen == ctx->oblk_left)) ? ctx->otrl_left : 0;
+    if(!hlen && !plen && !tlen)
+      break; /* nothing (more) to send */
+
+    if(hlen || (tlen && (plen <= FTP_BLK_COALESCE))) {
+      /* send the header and/or the end of file block with the payload */
+      if(hlen && (plen > FTP_BLK_COALESCE)) {
+        plen = FTP_BLK_COALESCE;
+        tlen = 0; /* the block does not end in this send */
+      }
+      if(!ctx->scratch) {
+        ctx->scratch = curlx_malloc(FTP_BLK_COALESCE + 2 * FTP_BLK_HDR_LEN);
+        if(!ctx->scratch)
+          return CURLE_OUT_OF_MEMORY;
+      }
+      memcpy(ctx->scratch, &ctx->ohdr[FTP_BLK_HDR_LEN - hlen], hlen);
+      if(plen)
+        memcpy(&ctx->scratch[hlen], pay, plen);
+      memcpy(&ctx->scratch[hlen + plen], &ftp_blk_eof[FTP_BLK_HDR_LEN - tlen],
+             tlen);
+      offered = hlen + plen + tlen;
+      result = Curl_conn_cf_send(cf->next, data, ctx->scratch, offered,
+                                 FALSE, &nw);
+    }
+    else if(plen) {
+      /* payload only, straight from the caller's buffer */
+      tlen = 0;
+      offered = plen;
+      result = Curl_conn_cf_send(cf->next, data, pay, plen, FALSE, &nw);
+    }
+    else {
+      offered = tlen;
+      result = Curl_conn_cf_send(cf->next, data,
+                                 &ftp_blk_eof[FTP_BLK_HDR_LEN - tlen], tlen,
+                                 FALSE, &nw);
+    }
+    if(result == CURLE_AGAIN) {
+      result = CURLE_OK;
+      nw = 0;
+    }
+    if(result)
+      break;
+    accepted = nw;
+
+    /* account for what was accepted: header, payload, end of file block */
+    n = CURLMIN(nw, hlen);
+    ctx->ohdr_left = (unsigned char)(ctx->ohdr_left - n);
+    nw -= n;
+    n = CURLMIN(nw, plen);
+    ctx->oblk_left -= n;
+    done += n;
+    nw -= n;
+    n = CURLMIN(nw, tlen);
+    ctx->otrl_left = (unsigned char)(ctx->otrl_left - n);
+    if(accepted < offered)
+      break; /* the connection takes no more for now */
+  }
+
+  *pnwritten = done;
+  if(!result && !done && len)
+    result = CURLE_AGAIN;
+  return result;
+}
+
+static bool cf_ftp_blk_data_pending(struct Curl_cfilter *cf,
+                                    const struct Curl_easy *data)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  if(ctx->recv_eof && !ctx->iblk_left)
+    /* the end of file is still to be reported. After that, whatever the
+       connection holds is not for this transfer */
+    return !ctx->recv_eof_told;
+  return cf->next ? cf->next->cft->has_data_pending(cf->next, data) : FALSE;
+}
+
+/* TRUE when the end of file block is committed but not completely sent */
+static bool cf_ftp_blk_eof_pending(struct cf_ftp_blk_ctx *ctx)
+{
+  return ctx->send_eof && !ctx->oblk_left && ctx->otrl_left;
+}
+
+static CURLcode cf_ftp_blk_flush(struct Curl_cfilter *cf,
+                                 struct Curl_easy *data)
+{
+  static const uint8_t nothing = 0;
+  size_t n;
+  return cf_ftp_blk_send(cf, data, &nothing, 0, TRUE, &n);
+}
+
+static CURLcode cf_ftp_blk_cntrl(struct Curl_cfilter *cf,
+                                 struct Curl_easy *data,
+                                 int event, int arg1, void *arg2)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  (void)arg1;
+  (void)arg2;
+  if((event == CF_CTRL_FLUSH) && cf_ftp_blk_eof_pending(ctx))
+    return cf_ftp_blk_flush(cf, data);
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_blk_query(struct Curl_cfilter *cf,
+                                 struct Curl_easy *data,
+                                 int query, int *pres1, void *pres2)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  if((query == CF_QUERY_NEED_FLUSH) && cf_ftp_blk_eof_pending(ctx)) {
+    *pres1 = TRUE;
+    return CURLE_OK;
+  }
+  return Curl_cf_def_query(cf, data, query, pres1, pres2);
+}
+
+static const struct Curl_cftype Curl_cft_ftp_blk = {
+  "FTP-BLOCK",
+  0,
+  CURL_LOG_LVL_NONE,
+  cf_ftp_blk_destroy,
+  Curl_cf_def_connect,
+  Curl_cf_def_shutdown,
+  Curl_cf_def_adjust_pollset,
+  cf_ftp_blk_data_pending,
+  cf_ftp_blk_send,
+  cf_ftp_blk_recv,
+  cf_ftp_blk_cntrl,
+  Curl_cf_def_conn_is_alive,
+  Curl_cf_def_conn_keep_alive,
+  cf_ftp_blk_query,
+};
+
+/* the block mode filter of the data connection, or NULL */
+static struct Curl_cfilter *ftp_blk_cf(struct connectdata *conn)
+{
+  struct Curl_cfilter *cf = conn->cfilter[SECONDARYSOCKET];
+  return (cf && (cf->cft == &Curl_cft_ftp_blk)) ? cf : NULL;
+}
+
+/* Put the block mode filter on top of the connected data connection, or
+   reset the one already there for a new transfer */
+static CURLcode ftp_blk_attach(struct Curl_easy *data)
+{
+  struct connectdata *conn = data->conn;
+  struct Curl_cfilter *cf = ftp_blk_cf(conn);
+
+  if(!cf) {
+    struct cf_ftp_blk_ctx *ctx = curlx_calloc(1, sizeof(*ctx));
+    CURLcode result;
+    if(!ctx)
+      return CURLE_OUT_OF_MEMORY;
+    result = Curl_cf_create(&cf, &Curl_cft_ftp_blk, ctx);
+    if(result) {
+      curlx_free(ctx);
+      return result;
+    }
+    cf->connected = TRUE;
+    Curl_conn_cf_add(data, conn, SECONDARYSOCKET, cf);
+  }
+  else
+    cf_ftp_blk_reset(cf->ctx);
+  return CURLE_OK;
+}
+
+/* Tell CURLINFO_FTP_TRANSFER_MODE the mode of this control connection */
+static void ftp_blk_info(struct Curl_easy *data, struct ftp_conn *ftpc)
+{
+  data->info.ftp_transfer_mode = (uint8_t)((ftpc->blk_mode == FTP_BLK_ON) ?
+                                           CURLFTPMODE_BLOCK :
+                                           CURLFTPMODE_STREAM);
+}
+
+/* Ask for block mode when wanted and not asked yet on this connection */
+static bool ftp_blk_ask(struct Curl_easy *data, struct ftp_conn *ftpc)
+{
+  return (data->set.ftp_transfer_mode == CURLFTPMODE_BLOCK) &&
+    (ftpc->blk_mode == FTP_BLK_UNKNOWN);
+}
+
+/* Wait for the data connection to be able to send or receive. */
+static int ftp_blk_wait(struct Curl_cfilter *cf, struct Curl_easy *data,
+                        bool sending, timediff_t timeout_ms)
+{
+  struct easy_pollset ps;
+  curl_socket_t sock = Curl_conn_cf_get_socket(cf, data);
+  CURLcode result;
+  int rc = -1;
+
+  if(sock == CURL_SOCKET_BAD)
+    return -1;
+  Curl_pollset_init(&ps);
+  if(sending)
+    result = Curl_pollset_add_out(data, &ps, sock);
+  else
+    result = Curl_pollset_add_in(data, &ps, sock);
+  if(!result)
+    result = Curl_conn_cf_adjust_pollset(cf->next, data, &ps);
+  if(!result)
+    rc = Curl_pollset_poll(data, &ps, CURLMIN(timeout_ms, 1000));
+  Curl_pollset_cleanup(&ps);
+  return rc;
+}
+
+/* After an upload, make sure the end of file block is completely sent,
+   waiting (blocking) if needed. TRUE when it is. */
+static bool ftp_blk_send_eof(struct Curl_easy *data, struct ftp_conn *ftpc,
+                             struct Curl_cfilter *cf)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+
+  if(ctx->failed || !ctx->send_eof || ctx->oblk_left)
+    return FALSE; /* the upload did not end properly */
+  ftpc->pp.response = *Curl_pgrs_now(data); /* timeout relative now */
+  while(ctx->otrl_left) {
+    timediff_t left;
+    if(cf_ftp_blk_flush(cf, data))
+      return FALSE;
+    if(!ctx->otrl_left)
+      break;
+    left = Curl_pp_state_timeleft_ms(data, &ftpc->pp);
+    if((left <= 0) || (ftp_blk_wait(cf, data, TRUE, left) < 0)) {
+      failf(data, "FTP block mode: failed to send the end of file");
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/* After a download, make sure the end of file block was received. A
+   download of known size ends before reading it: read it now, waiting
+   (blocking) if needed. Sets *keep when it arrived and nothing else did.
+   A data connection closing before it, or invalid data, is an error. */
+static CURLcode ftp_blk_recv_eof(struct Curl_easy *data,
+                                 struct ftp_conn *ftpc,
+                                 struct Curl_cfilter *cf, bool *keep)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+
+  *keep = FALSE;
+  ftpc->pp.response = *Curl_pgrs_now(data); /* timeout relative now */
+  while(!ctx->recv_eof_told) {
+    char buf[64];
+    size_t n;
+    CURLcode result = cf_ftp_blk_recv(cf, data, buf, sizeof(buf), &n);
+    if(result == CURLE_AGAIN) {
+      timediff_t left = Curl_pp_state_timeleft_ms(data, &ftpc->pp);
+      if(left <= 0) {
+        failf(data, "FTP block mode: no end of file");
+        return CURLE_OPERATION_TIMEDOUT;
+      }
+      if(ftp_blk_wait(cf, data, FALSE, left) < 0)
+        return CURLE_RECV_ERROR;
+      continue;
+    }
+    if(result)
+      return result;
+    if(n) {
+      infof(data, "FTP block mode: more data than expected, not keeping the "
+            "data connection");
+      return CURLE_OK;
+    }
+  }
+  *keep = TRUE;
+  return CURLE_OK;
+}
+
+/* Check that a kept, idle data connection is still usable: nothing must
+   have arrived on it, except protocol data that a lower filter consumes
+   (like TLS session tickets). EOF or anything else makes it unusable. */
+static bool ftp_blk_idle_check(struct Curl_easy *data,
+                               struct Curl_cfilter *cf)
+{
+  struct cf_ftp_blk_ctx *ctx = cf->ctx;
+  curl_socket_t sock = Curl_conn_cf_get_socket(cf, data);
+  char buf[64];
+  size_t n;
+
+  if(ctx->failed || (sock == CURL_SOCKET_BAD) || !cf->next)
+    return FALSE;
+  if(!cf->next->cft->has_data_pending(cf->next, data) &&
+     !SOCKET_READABLE(sock, 0))
+    return TRUE; /* nothing arrived */
+  /* something arrived, see what the filters below make of it */
+  return Curl_conn_cf_recv(cf->next, data, buf, sizeof(buf), &n) ==
+    CURLE_AGAIN;
 }
 
 #ifdef CURL_PREFER_LF_LINEENDS
@@ -545,11 +1020,20 @@ static CURLcode ftp_initiate_transfer(struct Curl_easy *data,
 {
   CURLcode result = CURLE_OK;
   bool connected;
+  bool blk = (ftpc->blk_mode == FTP_BLK_ON);
 
   CURL_TRC_FTP(data, "ftp_initiate_transfer()");
   result = Curl_conn_connect(data, SECONDARYSOCKET, TRUE, &connected);
   if(result || !connected)
     return result;
+
+  if(blk) {
+    /* block mode: the filter frames the data and marks the end of file, the
+       data connection is not shut down at the end of the transfer */
+    result = ftp_blk_attach(data);
+    if(result)
+      return result;
+  }
 
   if(data->state.upload) {
     /* When we know we are uploading a specified file, we can get the file
@@ -559,12 +1043,14 @@ static CURLcode ftp_initiate_transfer(struct Curl_easy *data,
     /* FTP upload, shutdown DATA, ignore shutdown errors, as we rely
      * on the server response on the CONTROL connection. */
     Curl_xfer_setup_send(data, SECONDARYSOCKET);
-    Curl_xfer_set_shutdown(data, TRUE, TRUE);
+    if(!blk)
+      Curl_xfer_set_shutdown(data, TRUE, TRUE);
   }
   else {
     /* FTP download, shutdown, do not ignore errors */
     Curl_xfer_setup_recv(data, SECONDARYSOCKET, data->req.size);
-    Curl_xfer_set_shutdown(data, TRUE, FALSE);
+    if(!blk)
+      Curl_xfer_set_shutdown(data, TRUE, FALSE);
   }
 
   ftpc->pp.pending_resp = TRUE; /* expect server response */
@@ -1446,27 +1932,16 @@ static CURLcode ftp_state_use_pasv(struct Curl_easy *data,
 }
 
 /*
- * ftp_state_prepare_transfer() starts PORT, PASV or PRET etc.
- *
- * REST is the last command in the chain of commands when a "head"-like
- * request is made. Thus, if an actual transfer is to be made this is where we
- * take off for real.
+ * ftp_state_data_setup() starts PORT, PASV or PRET etc. to set up a new data
+ * connection.
  */
-static CURLcode ftp_state_prepare_transfer(struct Curl_easy *data,
-                                           struct ftp_conn *ftpc,
-                                           struct FTP *ftp)
+static CURLcode ftp_state_data_setup(struct Curl_easy *data,
+                                     struct ftp_conn *ftpc)
 {
   CURLcode result = CURLE_OK;
   struct connectdata *conn = data->conn;
 
-  if(ftp->transfer != PPTRANSFER_BODY) {
-    /* does not transfer any data */
-
-    /* still possibly do PRE QUOTE jobs */
-    ftp_state(data, ftpc, FTP_RETR_PREQUOTE);
-    result = ftp_state_quote(data, ftpc, ftp, TRUE, FTP_RETR_PREQUOTE);
-  }
-  else if(data->set.ftp_use_port) {
+  if(data->set.ftp_use_port) {
     /* We have chosen to use the PORT (or similar) command */
     result = ftp_state_use_port(data, ftpc, EPRT);
   }
@@ -1490,6 +1965,76 @@ static CURLcode ftp_state_prepare_transfer(struct Curl_easy *data,
     else
       result = ftp_state_use_pasv(data, ftpc, conn);
   }
+  return result;
+}
+
+static bool ftp_strequal_or_null(const char *a, const char *b)
+{
+  return (!a && !b) || (a && b && !strcmp(a, b));
+}
+
+/* Decide if the transfer can use the kept block mode data connection, and
+   close that connection if not */
+static bool ftp_blk_reuse(struct Curl_easy *data, struct ftp_conn *ftpc)
+{
+  struct connectdata *conn = data->conn;
+  struct Curl_cfilter *cf = ftp_blk_cf(conn);
+  const char *port = data->set.ftp_use_port ?
+    CURL_EASY_STR(data, STRING_FTPPORT) : NULL;
+  bool ok = cf && (ftpc->blk_mode == FTP_BLK_ON) &&
+    Curl_conn_is_connected(conn, SECONDARYSOCKET) &&
+    (!data->set.ftp_use_port == !ftpc->blk_kept_active) &&
+    (!conn->bits.ftp_use_data_ssl == !ftpc->blk_kept_ssl) &&
+    (data->set.ipver == ftpc->blk_kept_ipver) &&
+    ftp_strequal_or_null(port, ftpc->blk_kept_port);
+
+  if(ok && !ftp_blk_idle_check(data, cf)) {
+    infof(data, "The kept FTP data connection is no longer usable");
+    ok = FALSE;
+  }
+  if(!ok) {
+    close_secondarysocket(data, ftpc);
+    return FALSE;
+  }
+  infof(data, "Reusing the kept FTP data connection");
+  return TRUE;
+}
+
+/*
+ * ftp_state_prepare_transfer() starts PORT, PASV or PRET etc.
+ *
+ * REST is the last command in the chain of commands when a "head"-like
+ * request is made. Thus, if an actual transfer is to be made this is where we
+ * take off for real.
+ */
+static CURLcode ftp_state_prepare_transfer(struct Curl_easy *data,
+                                           struct ftp_conn *ftpc,
+                                           struct FTP *ftp)
+{
+  CURLcode result = CURLE_OK;
+
+  if(ftp->transfer != PPTRANSFER_BODY) {
+    /* does not transfer any data */
+
+    /* still possibly do PRE QUOTE jobs */
+    ftp_state(data, ftpc, FTP_RETR_PREQUOTE);
+    result = ftp_state_quote(data, ftpc, ftp, TRUE, FTP_RETR_PREQUOTE);
+  }
+  else if(ftp_blk_ask(data, ftpc)) {
+    /* block mode is wanted on a connection that did not ask for it yet,
+       before any data connection is set up */
+    result = Curl_pp_sendf(data, &ftpc->pp, "%s", "MODE B");
+    if(!result)
+      ftp_state(data, ftpc, FTP_MODE_XFER);
+  }
+  else if(ftpc->blk_kept && ftp_blk_reuse(data, ftpc)) {
+    /* no PORT or PASV, send the transfer command on the kept connection */
+    ftpc->blk_reused = TRUE;
+    data->conn->bits.do_more = TRUE;
+    ftp_state(data, ftpc, FTP_STOP); /* this phase is completed */
+  }
+  else
+    result = ftp_state_data_setup(data, ftpc);
   return result;
 }
 
@@ -1764,8 +2309,10 @@ static CURLcode ftp_state_ul_setup(struct Curl_easy *data,
 
   result = Curl_pp_sendf(data, &ftpc->pp, append ? "APPE %s" : "STOR %s",
                          ftpc->file);
-  if(!result)
+  if(!result) {
+    ftpc->blk_append = !!append;
     ftp_state(data, ftpc, FTP_STOR);
+  }
 
   return result;
 }
@@ -1851,6 +2398,56 @@ static CURLcode ftp_state_retr(struct Curl_easy *data,
   }
 
   return result;
+}
+
+/* A quoted command may set the transfer mode, or make the server close a
+   kept data connection (RFC 959: changing the data port closes it) */
+static void ftp_blk_quote(struct Curl_easy *data, struct ftp_conn *ftpc,
+                          const char *cmd, int ftpcode)
+{
+  if(!cmd)
+    return;
+  if(*cmd == '*')
+    cmd++;
+  if(checkprefix("MODE ", cmd)) {
+    if((ftpcode / 100) == 2) {
+      ftpc->blk_mode = (unsigned char)((Curl_raw_toupper(cmd[5]) == 'B') ?
+                                       FTP_BLK_ON : FTP_BLK_OFF);
+      ftp_blk_info(data, ftpc);
+    }
+    else
+      return;
+  }
+  else if(!checkprefix("PASV", cmd) && !checkprefix("EPSV", cmd) &&
+          !checkprefix("LPSV", cmd) && !checkprefix("PORT", cmd) &&
+          !checkprefix("EPRT", cmd) && !checkprefix("LPRT", cmd) &&
+          !checkprefix("ABOR", cmd) && !checkprefix("REIN", cmd))
+    return;
+  if(ftpc->blk_kept && !ftpc->blk_reused)
+    close_secondarysocket(data, ftpc);
+}
+
+/* the command of a quote list sent last by ftp_state_quote() */
+static const char *ftp_quote_cmd(struct Curl_easy *data,
+                                 struct ftp_conn *ftpc)
+{
+  struct curl_slist *item;
+  int i;
+
+  switch(ftpc->state) {
+  case FTP_QUOTE:
+    item = data->set.quote;
+    break;
+  case FTP_POSTQUOTE:
+    item = data->set.postquote;
+    break;
+  default:
+    item = data->set.prequote;
+    break;
+  }
+  for(i = 0; item && (i < ftpc->count1); i++)
+    item = item->next;
+  return item ? item->data : NULL;
 }
 
 static CURLcode ftp_state_quote(struct Curl_easy *data,
@@ -2188,6 +2785,53 @@ error:
   return result;
 }
 
+/* The server answered 425 to a transfer command sent on the kept data
+   connection: close it and send the command again on a new one */
+static CURLcode ftp_blk_retry(struct Curl_easy *data, struct ftp_conn *ftpc,
+                              ftpstate instate)
+{
+  infof(data, "Server did not accept the kept FTP data connection, "
+        "setting up a new one");
+  close_secondarysocket(data, ftpc);
+  ftpc->blk_reused = FALSE;
+  ftpc->blk_retry = instate;
+  return ftp_state_data_setup(data, ftpc);
+}
+
+/* After ftp_blk_retry(), the new data connection is set up: send the
+   transfer command again */
+static CURLcode ftp_blk_resend(struct Curl_easy *data, struct ftp_conn *ftpc,
+                               struct FTP *ftp)
+{
+  CURLcode result;
+  ftpstate instate = ftpc->blk_retry;
+
+  ftpc->blk_retry = 0;
+  switch(instate) {
+  case FTP_STOR:
+    result = Curl_pp_sendf(data, &ftpc->pp,
+                           ftpc->blk_append ? "APPE %s" : "STOR %s",
+                           ftpc->file);
+    break;
+  case FTP_RETR:
+    if(data->state.resume_from) {
+      /* the 425 may have discarded the restart offset */
+      result = Curl_pp_sendf(data, &ftpc->pp, "REST %" FMT_OFF_T,
+                             data->state.resume_from);
+      instate = FTP_RETR_REST;
+    }
+    else
+      result = Curl_pp_sendf(data, &ftpc->pp, "RETR %s", ftpc->file);
+    break;
+  default:
+    DEBUGASSERT(instate == FTP_LIST);
+    return ftp_state_list(data, ftpc, ftp);
+  }
+  if(!result)
+    ftp_state(data, ftpc, instate);
+  return result;
+}
+
 /* called repeatedly until done from multi.c */
 static CURLcode ftp_statemach(struct Curl_easy *data,
                               struct ftp_conn *ftpc,
@@ -2258,6 +2902,11 @@ static CURLcode ftp_do_more(struct Curl_easy *data, domore *more)
        They are only done to kickstart the do_more state */
     result = ftp_statemach(data, ftpc, &complete);
 
+    if(complete && ftpc->blk_retry)
+      /* a new data connection is set up after a 425 on the kept one, send
+         the transfer command when it is connected */
+      return result;
+
     if(complete)
       *more = DOMORE_DONE;
 
@@ -2270,6 +2919,15 @@ static CURLcode ftp_do_more(struct Curl_easy *data, domore *more)
        TRUE but so is ftpc->wait_data_conn, which says we need to wait for the
        data connection and therefore we are not actually complete */
     *more = DOMORE_INCOMPLETE;
+  }
+  else if(ftpc->blk_retry) {
+    /* the new data connection is ready, send the transfer command again */
+    result = ftp_blk_resend(data, ftpc, ftp);
+    if(!result)
+      result = ftp_statemach(data, ftpc, &complete);
+    *more = (!ftpc->wait_data_conn && complete) ?
+      DOMORE_DONE : DOMORE_INCOMPLETE;
+    return result;
   }
 
   if(ftp->transfer <= PPTRANSFER_INFO) {
@@ -2753,6 +3411,9 @@ static CURLcode ftp_state_stor_resp(struct Curl_easy *data,
 {
   CURLcode result = CURLE_OK;
 
+  if((ftpcode == 425) && ftpc->blk_reused)
+    return ftp_blk_retry(data, ftpc, FTP_STOR);
+
   if(ftpcode >= 400) {
     failf(data, "Failed FTP upload: %0d", ftpcode);
     ftp_state(data, ftpc, FTP_STOP);
@@ -2877,6 +3538,8 @@ static CURLcode ftp_state_get_resp(struct Curl_easy *data,
     return ftp_initiate_transfer(data, ftpc);
   }
   else {
+    if((ftpcode == 425) && ftpc->blk_reused)
+      return ftp_blk_retry(data, ftpc, instate);
     if((instate == FTP_LIST) && (ftpcode == 450)) {
       /* no matching files in the directory listing */
       ftp->transfer = PPTRANSFER_NONE; /* do not download anything */
@@ -3020,6 +3683,23 @@ static CURLcode ftp_state_acct_resp(struct Curl_easy *data,
   return result;
 }
 
+/* The end of the connect phase, after login and PWD. Ask for block mode
+   here so that it is known after a perform that only logs in. */
+static CURLcode ftp_state_connect_done(struct Curl_easy *data,
+                                       struct ftp_conn *ftpc)
+{
+  if(ftp_blk_ask(data, ftpc)) {
+    CURLcode result = Curl_pp_sendf(data, &ftpc->pp, "%s", "MODE B");
+    if(!result)
+      ftp_state(data, ftpc, FTP_MODE);
+    return result;
+  }
+  ftp_blk_info(data, ftpc);
+  ftp_state(data, ftpc, FTP_STOP); /* we are done with CONNECT phase! */
+  CURL_TRC_FTP(data, "[%s] protocol connect phase DONE", FTP_CSTATE(ftpc));
+  return CURLE_OK;
+}
+
 static CURLcode ftp_pwd_resp(struct Curl_easy *data,
                              struct ftp_conn *ftpc,
                              int ftpcode)
@@ -3119,9 +3799,7 @@ static CURLcode ftp_pwd_resp(struct Curl_easy *data,
       infof(data, "Failed to figure out path");
     }
   }
-  ftp_state(data, ftpc, FTP_STOP); /* we are done with CONNECT phase! */
-  CURL_TRC_FTP(data, "[%s] protocol connect phase DONE", FTP_CSTATE(ftpc));
-  return CURLE_OK;
+  return ftp_state_connect_done(data, ftpc);
 }
 
 static const char * const ftpauth[] = { "SSL", "TLS" };
@@ -3349,8 +4027,7 @@ static CURLcode ftp_pp_statemachine(struct Curl_easy *data,
       /* Cannot identify server OS. Continue anyway and cross fingers. */
     }
 
-    ftp_state(data, ftpc, FTP_STOP); /* we are done with CONNECT phase! */
-    CURL_TRC_FTP(data, "[%s] protocol connect phase DONE", FTP_CSTATE(ftpc));
+    result = ftp_state_connect_done(data, ftpc);
     break;
 
   case FTP_NAMEFMT:
@@ -3360,8 +4037,28 @@ static CURLcode ftp_pp_statemachine(struct Curl_easy *data,
       break;
     }
 
-    ftp_state(data, ftpc, FTP_STOP); /* we are done with CONNECT phase! */
-    CURL_TRC_FTP(data, "[%s] protocol connect phase DONE", FTP_CSTATE(ftpc));
+    result = ftp_state_connect_done(data, ftpc);
+    break;
+
+  case FTP_MODE:
+  case FTP_MODE_XFER:
+    /* only 200 means that the server uses block mode now */
+    if(ftpcode == 200) {
+      ftpc->blk_mode = FTP_BLK_ON;
+      infof(data, "FTP block mode (MODE B) in use");
+    }
+    else {
+      ftpc->blk_mode = FTP_BLK_OFF;
+      infof(data, "Server refused MODE B (%03d), using stream mode", ftpcode);
+    }
+    ftp_blk_info(data, ftpc);
+    if(ftpc->state == FTP_MODE) {
+      ftp_state(data, ftpc, FTP_STOP); /* we are done with CONNECT phase! */
+      CURL_TRC_FTP(data, "[%s] protocol connect phase DONE",
+                   FTP_CSTATE(ftpc));
+    }
+    else
+      result = ftp_state_prepare_transfer(data, ftpc, ftp);
     break;
 
   case FTP_QUOTE:
@@ -3369,6 +4066,7 @@ static CURLcode ftp_pp_statemachine(struct Curl_easy *data,
   case FTP_RETR_PREQUOTE:
   case FTP_STOR_PREQUOTE:
   case FTP_LIST_PREQUOTE:
+    ftp_blk_quote(data, ftpc, ftp_quote_cmd(data, ftpc), ftpcode);
     if((ftpcode >= 400) && !ftpc->count2) {
       /* failure response code, and not allowed to fail */
       failf(data, "QUOT command failed with %03d", ftpcode);
@@ -3601,6 +4299,7 @@ static CURLcode ftp_sendquote(struct Curl_easy *data,
       }
       if(result)
         return result;
+      ftp_blk_quote(data, ftpc, cmd, ftpcode);
 
       if(!acceptfail && (ftpcode >= 400)) {
         failf(data, "QUOT string not accepted: %s", cmd);
@@ -3729,12 +4428,13 @@ static CURLcode ftp_done_secondary_socket(struct Curl_easy *data,
 static CURLcode ftp_done_control_reply(struct Curl_easy *data,
                                        struct ftp_conn *ftpc,
                                        struct FTP *ftp, CURLcode result,
-                                       bool premature)
+                                       bool premature, int *pftpcode)
 {
   struct connectdata *conn = data->conn;
   size_t nread;
   int ftpcode;
 
+  *pftpcode = 0;
   if(!result && (ftp->transfer == PPTRANSFER_BODY) && ftpc->ctl_valid &&
      ftpc->pp.pending_resp && !premature) {
     /*
@@ -3745,6 +4445,7 @@ static CURLcode ftp_done_control_reply(struct Curl_easy *data,
      */
     ftpc->pp.response = *Curl_pgrs_now(data); /* timeout relative now */
     result = getftpresponse(data, &nread, &ftpcode);
+    *pftpcode = ftpcode;
 
     if(!nread && (result == CURLE_OPERATION_TIMEDOUT)) {
       failf(data, "control connection looks dead");
@@ -3781,6 +4482,54 @@ static CURLcode ftp_done_control_reply(struct Curl_easy *data,
     }
   }
   return result;
+}
+
+/*
+ * In block mode, check if the data connection of a transfer that went well
+ * can be kept for the next one, pending the final reply: the end of file
+ * block must be completely sent or received. Not for partial downloads.
+ */
+static bool ftp_blk_done_data(struct Curl_easy *data, struct ftp_conn *ftpc,
+                              struct FTP *ftp, CURLcode status,
+                              CURLcode result, bool premature,
+                              CURLcode *presult)
+{
+  struct Curl_cfilter *cf = ftp_blk_cf(data->conn);
+  bool keep;
+
+  *presult = CURLE_OK;
+  if(!cf || status || result || premature ||
+     (ftpc->blk_mode != FTP_BLK_ON) ||
+     (ftp->transfer != PPTRANSFER_BODY) || !ftpc->ctl_valid ||
+     !ftpc->pp.pending_resp ||
+     (ftpc->dont_check && (data->req.maxdownload > 0)))
+    return FALSE;
+  if(data->state.upload)
+    /* if the end of file is not sent, the server reports the failure */
+    return ftp_blk_send_eof(data, ftpc, cf);
+  *presult = ftp_blk_recv_eof(data, ftpc, cf, &keep);
+  return keep;
+}
+
+/* keep the block mode data connection open for the next transfer */
+static void ftp_blk_keep(struct Curl_easy *data, struct ftp_conn *ftpc)
+{
+  const char *port = data->set.ftp_use_port ?
+    CURL_EASY_STR(data, STRING_FTPPORT) : NULL;
+
+  curlx_safefree(ftpc->blk_kept_port);
+  if(port) {
+    ftpc->blk_kept_port = curlx_strdup(port);
+    if(!ftpc->blk_kept_port) {
+      close_secondarysocket(data, ftpc);
+      return;
+    }
+  }
+  ftpc->blk_kept_active = !!data->set.ftp_use_port;
+  ftpc->blk_kept_ssl = !!data->conn->bits.ftp_use_data_ssl;
+  ftpc->blk_kept_ipver = data->set.ipver;
+  ftpc->blk_kept = TRUE;
+  CURL_TRC_FTP(data, "[%s] keeping the DATA connection", FTP_CSTATE(ftpc));
 }
 
 static CURLcode ftp_done_check_partial(struct Curl_easy *data,
@@ -3839,6 +4588,9 @@ static CURLcode ftp_done(struct Curl_easy *data, CURLcode status,
   struct FTP *ftp = Curl_meta_get(data, CURL_META_FTP_EASY);
   struct ftp_conn *ftpc = Curl_conn_meta_get(data->conn, CURL_META_FTP_CONN);
   CURLcode result;
+  int ftpcode;
+  bool blk_keep = FALSE;
+  CURLcode blk_result = CURLE_OK;
 
   if(!ftp || !ftpc)
     return CURLE_OK;
@@ -3847,13 +4599,33 @@ static CURLcode ftp_done(struct Curl_easy *data, CURLcode status,
 
   ftp_done_wildcard(data, ftpc);
   ftp_done_path(data, ftpc, result);
-  result = ftp_done_secondary_socket(data, ftpc, result);
-  result = ftp_done_control_reply(data, ftpc, ftp, result, premature);
+  if(!ftpc->blk_kept || ftpc->blk_reused) {
+    /* unless this is a kept data connection this transfer did not use */
+    blk_keep = ftp_blk_done_data(data, ftpc, ftp, status, result,
+                                 premature, &blk_result);
+    if(!blk_keep)
+      result = ftp_done_secondary_socket(data, ftpc, result);
+  }
+  /* read the reply even after a block mode data error, to stay in sync */
+  result = ftp_done_control_reply(data, ftpc, ftp, result, premature,
+                                  &ftpcode);
+  if(!result)
+    result = blk_result;
   result = ftp_done_check_partial(data, ftpc, ftp, result, premature);
+
+  if(blk_keep) {
+    /* 250, not 226 which says that the server closes the data connection */
+    if(!result && (ftpcode == 250) && ftpc->ctl_valid)
+      ftp_blk_keep(data, ftpc);
+    else
+      close_secondarysocket(data, ftpc);
+  }
 
   /* clear these for next connection */
   ftp->transfer = PPTRANSFER_BODY;
   ftpc->dont_check = FALSE;
+  ftpc->blk_reused = FALSE;
+  ftpc->blk_retry = 0;
 
   /* Send any post-transfer QUOTE strings? */
   if(!status && !result && !premature && data->set.postquote)
@@ -4242,6 +5014,9 @@ static CURLcode ftp_do(struct Curl_easy *data, bool *done)
   if(!ftpc || !ftp)
     return CURLE_FAILED_INIT;
   ftpc->wait_data_conn = FALSE; /* default to no such wait */
+  ftpc->blk_reused = FALSE;
+  ftpc->blk_retry = 0;
+  ftp_blk_info(data, ftpc);
 
 #ifdef CURL_PREFER_LF_LINEENDS
   {
@@ -4389,6 +5164,7 @@ static void ftp_conn_dtor(void *key, size_t klen, void *entry)
   curlx_safefree(ftpc->entrypath);
   curlx_safefree(ftpc->prevpath);
   curlx_safefree(ftpc->server_os);
+  curlx_safefree(ftpc->blk_kept_port);
   Curl_pp_disconnect(&ftpc->pp);
   curlx_free(ftpc);
 }
@@ -4467,6 +5243,7 @@ static CURLcode ftp_setup_connection(struct Curl_easy *data,
   ftpc->known_filesize = -1; /* unknown size for now */
   ftpc->use_ssl = data->set.use_ssl;
   ftpc->ccc = data->set.ftp_ccc;
+  ftpc->blk_want = data->set.ftp_transfer_mode;
 
   CURL_TRC_FTP(data, "[%s] setup connection -> %d", FTP_CSTATE(ftpc),
                (int)result);
@@ -4483,6 +5260,11 @@ bool Curl_ftp_conns_match(struct connectdata *needle, struct connectdata *conn)
      Curl_timestrcmp(nftpc->alternative_to_user,
                      cftpc->alternative_to_user) ||
      (nftpc->ccc != cftpc->ccc))
+    return FALSE;
+  /* A connection in block mode is not for a transfer that wants stream
+     mode, which never sends MODE */
+  if((nftpc->blk_want != CURLFTPMODE_BLOCK) &&
+     (cftpc->blk_mode == FTP_BLK_ON))
     return FALSE;
   /* A mismatch on `use_ssl` MUST have been found in connection matching
    * before we come here. This is a check on MAYBE/MUST use of STARTTLS and

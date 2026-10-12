@@ -1013,6 +1013,12 @@
      d  CURLFTPMETHOD_SINGLECWD...
      d                 c                   3
       *
+     d curl_ftpmode    s             10i 0 based(######ptr######)               Enum
+     d  CURLFTPMODE_STREAM...
+     d                 c                   0
+     d  CURLFTPMODE_BLOCK...
+     d                 c                   1
+      *
      d  CURLHEADER_UNIFIED...
      d                 c                   X'00000000'
      d  CURLHEADER_SEPARATE...
@@ -1722,6 +1728,8 @@
      d                 c                   10331
      d  CURLOPT_HTTPSIG_HEADERS...
      d                 c                   10332
+     d  CURLOPT_FTP_TRANSFER_MODE...
+     d                 c                   00333
       *
       /if not defined(CURL_NO_OLDIES)
      d  CURLOPT_FILE   c                   10001
@@ -1975,6 +1983,8 @@
      d                 c                   X'00200046'
      d CURLINFO_SIZE_DELIVERED...                                               CURLINFO_OFF_T + 71
      d                 c                   X'00600047'
+     d CURLINFO_FTP_TRANSFER_MODE...                                            CURLINFO_LONG + 72
+     d                 c                   X'00200048'
       *
      d  CURLINFO_HTTP_CODE...                                                   Old ...RESPONSE_CODE
      d                 c                   X'00200002'

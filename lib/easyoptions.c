@@ -115,6 +115,7 @@ const struct curl_easyoption Curl_easyopts[] = {
   { "FTP_SKIP_PASV_IP", CURLOPT_FTP_SKIP_PASV_IP, CURLOT_LONG, 0 },
   { "FTP_SSL", CURLOPT_USE_SSL, CURLOT_VALUES, CURLOT_FLAG_ALIAS },
   { "FTP_SSL_CCC", CURLOPT_FTP_SSL_CCC, CURLOT_LONG, 0 },
+  { "FTP_TRANSFER_MODE", CURLOPT_FTP_TRANSFER_MODE, CURLOT_VALUES, 0 },
   { "FTP_USE_EPRT", CURLOPT_FTP_USE_EPRT, CURLOT_LONG, 0 },
   { "FTP_USE_EPSV", CURLOPT_FTP_USE_EPSV, CURLOT_LONG, 0 },
   { "FTP_USE_PRET", CURLOPT_FTP_USE_PRET, CURLOT_LONG, 0 },
@@ -389,6 +390,6 @@ const struct curl_easyoption Curl_easyopts[] = {
  */
 int Curl_easyopts_check(void)
 {
-  return (CURLOPT_LASTENTRY % 10000) != (332 + 1);
+  return (CURLOPT_LASTENTRY % 10000) != (333 + 1);
 }
 #endif

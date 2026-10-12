@@ -46,6 +46,7 @@ man_MANS =                                      \
   CURLINFO_FILETIME.3                           \
   CURLINFO_FILETIME_T.3                         \
   CURLINFO_FTP_ENTRY_PATH.3                     \
+  CURLINFO_FTP_TRANSFER_MODE.3                  \
   CURLINFO_HEADER_SIZE.3                        \
   CURLINFO_HTTP_CONNECTCODE.3                   \
   CURLINFO_HTTP_VERSION.3                       \
@@ -198,6 +199,7 @@ man_MANS =                                      \
   CURLOPT_FTP_FILEMETHOD.3                      \
   CURLOPT_FTP_SKIP_PASV_IP.3                    \
   CURLOPT_FTP_SSL_CCC.3                         \
+  CURLOPT_FTP_TRANSFER_MODE.3                   \
   CURLOPT_FTP_USE_EPRT.3                        \
   CURLOPT_FTP_USE_EPSV.3                        \
   CURLOPT_FTP_USE_PRET.3                        \

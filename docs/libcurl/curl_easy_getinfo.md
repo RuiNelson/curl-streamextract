@@ -138,6 +138,10 @@ Remote time of the retrieved document. See CURLINFO_FILETIME_T(3)
 The entry path after logging in to an FTP server. See
 CURLINFO_FTP_ENTRY_PATH(3)
 
+## CURLINFO_FTP_TRANSFER_MODE
+
+The FTP transfer mode in use. See CURLINFO_FTP_TRANSFER_MODE(3)
+
 ## CURLINFO_HEADER_SIZE
 
 Number of bytes of all headers received. See CURLINFO_HEADER_SIZE(3)

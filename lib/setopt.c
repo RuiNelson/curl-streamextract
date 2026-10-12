@@ -1120,6 +1120,12 @@ static CURLcode setopt_long_proto(struct Curl_easy *data, CURLoption option,
     else
       s->ftp_ccc = (unsigned char)arg;
     break;
+  case CURLOPT_FTP_TRANSFER_MODE:
+    if((arg < CURLFTPMODE_STREAM) || (arg >= CURLFTPMODE_LAST))
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+    else
+      s->ftp_transfer_mode = (unsigned char)arg;
+    break;
   case CURLOPT_FTPSSLAUTH:
     if((arg < CURLFTPAUTH_DEFAULT) || (arg >= CURLFTPAUTH_LAST))
       result = CURLE_BAD_FUNCTION_ARGUMENT;
