@@ -149,6 +149,7 @@ my $ctrldelay;     # set if server should throttle ctrl stream
 my $datadelay;     # set if server should throttle data stream
 my $retrweirdo;    # set if FTP server should use RETRWEIRDO
 my $retrnosize;    # set if FTP server should use RETRNOSIZE
+my $storblock;     # set if STOR data uses block mode framing (STORBLOCK)
 my $retrsize;      # set if FTP server should use RETRSIZE
 my $pasvbadip;     # set if FTP server should use PASVBADIP
 my $nosave;        # set if FTP server should not save uploaded data
@@ -2371,6 +2372,22 @@ sub RETR_ftp {
     return 0;
 }
 
+# Return TRUE if the data holds complete FTP block mode (MODE B) blocks
+# up to and including one with the end of file flag (0x40).
+sub blockmode_eof {
+    my ($data) = @_;
+    my $pos = 0;
+    my $len = length($data);
+    while($pos + 3 <= $len) {
+        my $desc = ord(substr($data, $pos, 1));
+        my $size = unpack("n", substr($data, $pos + 1, 2));
+        return 0 if($pos + 3 + $size > $len);
+        $pos += 3 + $size;
+        return 1 if($desc & 0x40);
+    }
+    return 0;
+}
+
 sub STOR_ftp {
     my $testno = $_[0];
 
@@ -2405,6 +2422,7 @@ sub STOR_ftp {
     my $line;
     my $ulsize = 0;
     my $disc = 0;
+    my $blockdata = "";
     while(5 == (sysread DREAD, $line, 5)) {
         if($line eq "DATA\n") {
             my $i;
@@ -2422,6 +2440,15 @@ sub STOR_ftp {
             $ulsize += $size;
             print $file $line if(!$nosave);
             logmsg "> Appending $size bytes to file\n";
+            if($storblock) {
+                # block mode: the client does not close the data
+                # connection, the end of file block ends the upload
+                $blockdata .= $line;
+                if(blockmode_eof($blockdata)) {
+                    logmsg "> Got the block mode end of file\n";
+                    last;
+                }
+            }
         }
         elsif($line eq "DISC\n") {
             # disconnect!
@@ -2810,6 +2837,7 @@ sub customize {
     $datadelay = 0;     # default is no throttling of the data stream
     $retrweirdo = 0;    # default is no use of RETRWEIRDO
     $retrnosize = 0;    # default is no use of RETRNOSIZE
+    $storblock = 0;     # default is no use of STORBLOCK
     $retrsize = 0;      # default is no use of RETRSIZE
     $pasvbadip = 0;     # default is no use of PASVBADIP
     $nosave = 0;        # default is to actually save uploaded data to file
@@ -2882,6 +2910,10 @@ sub customize {
         elsif($_ =~ /RETRNOSIZE/) {
             logmsg "FTPD: instructed to use RETRNOSIZE\n";
             $retrnosize = 1;
+        }
+        elsif($_ =~ /STORBLOCK/) {
+            logmsg "FTPD: instructed to use STORBLOCK\n";
+            $storblock = 1;
         }
         elsif($_ =~ /RETRSIZE (\d+)/) {
             $retrsize = $1;
