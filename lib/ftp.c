@@ -2388,6 +2388,10 @@ static CURLcode ftp_dophase_done(struct Curl_easy *data,
       close_secondarysocket(data, ftpc);
       return result;
     }
+    if(completed == DOMORE_DONE)
+      /* ftp_do_more() completed already: it must not run again in a
+         DO_MORE phase, it would send the transfer command again */
+      data->conn->bits.do_more = FALSE;
   }
 
   if(ftp->transfer != PPTRANSFER_BODY)
