@@ -62,6 +62,11 @@ EXTRA_DIST =         \
   http3-server.pl    \
   memanalyze.pl      \
   memanalyzer.pm     \
+  mode-b/.checksrc   \
+  mode-b/README.md   \
+  mode-b/modeb_client.c \
+  mode-b/modeb_server.py \
+  mode-b/run_tests.py \
   negtelnetserver.py \
   nghttpx.conf       \
   pathhelp.pm        \

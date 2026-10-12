@@ -1,0 +1,10 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# modeb_client.c is a standalone libcurl program, like the examples
+allowfunc atoi
+allowfunc fprintf
+allowfunc printf
+allowfunc snprintf
+allowfunc strtoul
