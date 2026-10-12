@@ -1246,13 +1246,11 @@ static CURLcode sftp_download_stat(struct Curl_easy *data,
     return CURLE_OK;
   }
   if(rc ||
-     !(attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ||
-     (attrs.filesize == 0)) {
+     !(attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)) {
     /*
      * libssh2_sftp_open() did not return an error, so maybe the server
      * does not support stat()
      * OR the server does not return a file size with a stat()
-     * OR file size is 0
      */
     data->req.size = -1;
     data->req.maxdownload = -1;
