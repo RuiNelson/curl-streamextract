@@ -427,7 +427,7 @@ CURLcode Curl_ssh_setup_pkey(struct Curl_easy *data, struct ssh_conn *sshc)
         goto fail;
     }
 
-    sshc->passphrase = data->set.ssl.primary.key_passwd;
+    sshc->passphrase = CURL_EASY_STR(data, STRING_KEY_PASSWD);
     if(!sshc->passphrase)
       sshc->passphrase = "";
 
