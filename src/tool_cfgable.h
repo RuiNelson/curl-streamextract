@@ -225,6 +225,7 @@ struct OperationConfig {
   BIT(disable_epsv);
   BIT(disable_eprt);
   BIT(ftp_pret);
+  BIT(ftp_block_mode);
   BIT(proto_present);
   BIT(proto_redir_present);
   BIT(mail_rcpt_allowfails); /* --mail-rcpt-allowfails */

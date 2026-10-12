@@ -71,6 +71,7 @@
 --form-string                        7.13.2
 --ftp-account                        7.13.0
 --ftp-alternative-to-user            7.15.5
+--ftp-block-mode                     8.23.0
 --ftp-create-dirs                    7.10.7
 --ftp-method                         7.15.1
 --ftp-pasv                           7.11.0

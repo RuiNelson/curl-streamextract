@@ -141,6 +141,7 @@ static const struct LongShort aliases[] = {
   {"form-string",                ARG_STRG, ' ', C_FORM_STRING},
   {"ftp-account",                ARG_STRG, ' ', C_FTP_ACCOUNT},
   {"ftp-alternative-to-user",    ARG_STRG, ' ', C_FTP_ALTERNATIVE_TO_USER},
+  {"ftp-block-mode",             ARG_BOOL, ' ', C_FTP_BLOCK_MODE},
   {"ftp-create-dirs",            ARG_BOOL, ' ', C_FTP_CREATE_DIRS},
   {"ftp-method",                 ARG_STRG, ' ', C_FTP_METHOD},
   {"ftp-pasv",                   ARG_NONE, ' ', C_FTP_PASV},
@@ -1995,6 +1996,9 @@ static ParameterError opt_bool(struct OperationConfig *config,
     break;
   case C_FTP_PRET: /* --ftp-pret */
     config->ftp_pret = toggle;
+    break;
+  case C_FTP_BLOCK_MODE: /* --ftp-block-mode */
+    config->ftp_block_mode = toggle;
     break;
   case C_SASL_IR: /* --sasl-ir */
     config->sasl_ir = toggle;
