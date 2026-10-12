@@ -73,6 +73,7 @@ class Config:
         self.files = {}                  # name -> bytes served by RETR
         self.listing = b''               # LIST/NLST payload
         self.tls_ctx = None              # server ssl.SSLContext for FTPS
+        self.implicit_tls = False        # TLS from the start (ftps://)
 
 
 class Session:
@@ -480,6 +481,12 @@ class Server:
             t.start()
 
     def run_session(self, conn):
+        try:
+            if self.cfg.implicit_tls:
+                conn = self.cfg.tls_ctx.wrap_socket(conn, server_side=True)
+        except (OSError, ssl.SSLError):
+            conn.close()
+            return
         s = Session(self, conn)
         try:
             s.handle()

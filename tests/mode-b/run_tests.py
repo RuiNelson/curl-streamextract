@@ -588,6 +588,27 @@ def test_ftps(env):
     check(all(o['result'] == 0 and o['mode'] == 1 for o in out), out)
 
 
+def test_ftps_implicit(env):
+    """implicit FTPS (ftps://), PROT P: the TLS data connection is reused"""
+    if not env.tls_ctx:
+        raise Skip('no openssl to make a certificate')
+    srv = env.server(implicit_tls=True, files={'s': os.urandom(100000)})
+    base = 'ftps://127.0.0.1:%d/' % srv.port
+    files = {}
+    args = ['-k']
+    for i, size in enumerate([0, 1, 70000]):
+        name = 'i%d' % i
+        files[name] = os.urandom(size)
+        args += ['-T', env.file(name, files[name]), base + name]
+    outp = os.path.join(env.tmp, 'impl-s')
+    env.run_curl(ops(args, ['-k', base + 's', '-o', outp]))
+    check_files(srv, files)
+    with open(outp, 'rb') as f:
+        check(f.read() == srv.cfg.files['s'], 'download differs')
+    check('PROT P' in srv.log and srv.count('AUTH') == 0, srv.log)
+    check(data_setups(srv) == 1, 'data setups: %d' % data_setups(srv))
+
+
 def test_stream_option(env):
     """CURLFTPMODE_STREAM (default): no MODE command"""
     srv = env.server(files={'x': os.urandom(1000)})
