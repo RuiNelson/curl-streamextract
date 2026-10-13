@@ -368,6 +368,14 @@ CURLOPT_FTP_CREATE_MISSING_DIRS(3)
 
 Specify how to reach files. See CURLOPT_FTP_FILEMETHOD(3)
 
+## CURLOPT_FTP_MC_CONNECTIONS
+
+Number of parallel FTP data connections. See CURLOPT_FTP_MC_CONNECTIONS(3)
+
+## CURLOPT_FTP_MC_STRIPE
+
+FTPMC stripe size. See CURLOPT_FTP_MC_STRIPE(3)
+
 ## CURLOPT_FTP_SKIP_PASV_IP
 
 Ignore the IP address in the PASV response. See CURLOPT_FTP_SKIP_PASV_IP(3)

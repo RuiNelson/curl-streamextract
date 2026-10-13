@@ -38,6 +38,10 @@ typedef enum {
                             file */
 } curl_ftpfile;
 
+/* largest CURLOPT_FTP_MC_CONNECTIONS, the number of parallel FTPMC data
+   connections */
+#define CURL_FTP_MC_MAX_CONNECTIONS 64
+
 #endif /* CURL_DISABLE_FTP */
 
 #define DEFAULT_ACCEPT_TIMEOUT   60000 /* milliseconds == one minute */

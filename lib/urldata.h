@@ -419,6 +419,8 @@ struct PureInfo {
   uint8_t pxcode; /* holds a CURLproxycode */
   uint8_t ftp_transfer_mode; /* CURLFTPMODE_* in effect for the most recent
                                 FTP transfer, CURLINFO_FTP_TRANSFER_MODE */
+  uint8_t ftp_mc_conns; /* data connections of the most recent FTP transfer
+                           when FTPMC was used, CURLINFO_FTP_MC_CONNECTIONS */
   BIT(timecond);  /* set to TRUE if the time condition did not match, which
                      thus made the document NOT get fetched */
   BIT(used_proxy); /* the transfer used a proxy */
@@ -1018,6 +1020,8 @@ struct UserDefined {
   uint8_t ftpsslauth; /* what AUTH XXX to try: curl_ftpauth */
   uint8_t ftp_ccc;   /* FTP CCC options: curl_ftpccc */
   uint8_t ftp_transfer_mode; /* CURLFTPMODE_* (curl_ftpmode) */
+  uint8_t ftp_mc_conns; /* FTPMC data connections wanted, 0 for none */
+  uint32_t ftp_mc_stripe; /* FTPMC stripe size wanted, 0 for the server's */
 #endif
   uint8_t httpsig_algorithm; /* CURLHTTPSIG_* algorithm for RFC 9421 */
   uint8_t use_ssl;   /* if AUTH TLS is to be attempted etc, for FTP or IMAP or
