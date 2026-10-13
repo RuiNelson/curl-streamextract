@@ -1036,6 +1036,16 @@ typedef enum {
   CURLFTPMETHOD_LAST = 4 /* not an option, never use */
 } curl_ftpmethod;
 
+/* parameter for the CURLOPT_FTP_TRANSFER_MODE option */
+#define CURLFTPMODE_STREAM 0L /* stream mode, never send MODE */
+#define CURLFTPMODE_BLOCK  1L /* ask for block mode (MODE B), keep and reuse
+                                 the data connection, fall back to stream
+                                 mode if refused */
+
+typedef enum {
+  CURLFTPMODE_LAST = 2 /* not an option, never use */
+} curl_ftpmode;
+
 /* bitmask defines for CURLOPT_HEADEROPT */
 #define CURLHEADER_UNIFIED  0L
 #define CURLHEADER_SEPARATE (1L << 0)
@@ -2288,6 +2298,9 @@ typedef enum {
   /* Space-separated list of components to sign for HTTP Message Signatures */
   CURLOPT(CURLOPT_HTTPSIG_HEADERS, CURLOPTTYPE_STRINGPOINT, 332),
 
+  /* FTP transfer mode, CURLFTPMODE_STREAM or CURLFTPMODE_BLOCK */
+  CURLOPT(CURLOPT_FTP_TRANSFER_MODE, CURLOPTTYPE_VALUES, 333),
+
   CURLOPT_LASTENTRY /* the last unused */
 } CURLoption;
 
@@ -3022,7 +3035,8 @@ typedef enum {
   CURLINFO_HTTPAUTH_USED    = CURLINFO_LONG + 69,
   CURLINFO_PROXYAUTH_USED   = CURLINFO_LONG + 70,
   CURLINFO_SIZE_DELIVERED   = CURLINFO_OFF_T + 71,
-  CURLINFO_LASTONE          = 71
+  CURLINFO_FTP_TRANSFER_MODE = CURLINFO_LONG + 72,
+  CURLINFO_LASTONE          = 72
 } CURLINFO;
 
 /* CURLINFO_RESPONSE_CODE is the new name for the option previously known as

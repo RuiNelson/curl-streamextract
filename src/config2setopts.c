@@ -784,6 +784,9 @@ static CURLcode ftp_setopts(struct OperationConfig *config, CURL *curl,
   if(config->ftp_pret)
     my_setopt_long(curl, CURLOPT_FTP_USE_PRET, 1);
 
+  if(config->ftp_block_mode)
+    my_setopt_long(curl, CURLOPT_FTP_TRANSFER_MODE, CURLFTPMODE_BLOCK);
+
   return result;
 }
 

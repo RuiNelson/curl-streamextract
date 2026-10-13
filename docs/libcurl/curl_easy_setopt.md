@@ -376,6 +376,11 @@ Ignore the IP address in the PASV response. See CURLOPT_FTP_SKIP_PASV_IP(3)
 
 Back to non-TLS again after authentication. See CURLOPT_FTP_SSL_CCC(3)
 
+## CURLOPT_FTP_TRANSFER_MODE
+
+Stream or block mode, keep the data connection. See
+CURLOPT_FTP_TRANSFER_MODE(3)
+
 ## CURLOPT_FTP_USE_EPRT
 
 Use EPRT. See CURLOPT_FTP_USE_EPRT(3)

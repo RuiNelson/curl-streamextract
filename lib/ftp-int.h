@@ -46,6 +46,8 @@ enum {
   FTP_PWD,
   FTP_SYST,
   FTP_NAMEFMT,
+  FTP_MODE, /* MODE B at the end of the connect phase */
+  FTP_MODE_XFER, /* MODE B before setting up a data connection */
   FTP_QUOTE, /* waiting for a response to a command sent in a quote list */
   FTP_RETR_PREQUOTE,
   FTP_STOR_PREQUOTE,
@@ -95,6 +97,11 @@ struct FTP {
   curl_off_t downloadsize;
 };
 
+/* ftp_conn->blk_mode values: the result of asking for block mode */
+#define FTP_BLK_UNKNOWN 0 /* MODE B not sent on this connection */
+#define FTP_BLK_ON      1 /* server accepted MODE B */
+#define FTP_BLK_OFF     2 /* server refused MODE B, stream mode */
+
 /* one struct entry for each path component (of 'rawpath') */
 struct pathcomp {
   int start; /* start column */
@@ -115,6 +122,7 @@ struct ftp_conn {
   char transfertype; /* set by ftp_transfertype for use by Curl_client_write()a
                         and others (A/I or zero) */
   char *server_os;     /* The target server operating system. */
+  char *blk_kept_port; /* CURLOPT_FTPPORT of the kept data connection */
   curl_off_t known_filesize; /* file size is different from -1, if wildcard
                                 LIST parsing was done and wc_statemach set
                                 it */
@@ -130,6 +138,16 @@ struct ftp_conn {
   unsigned char use_ssl;   /* if AUTH TLS is to be attempted etc, for FTP or
                               IMAP or POP3 or others! (type: curl_usessl)*/
   unsigned char ccc;       /* ccc level for this connection */
+  unsigned char blk_want;  /* CURLOPT_FTP_TRANSFER_MODE when created */
+  unsigned char blk_mode;  /* FTP_BLK_* */
+  unsigned char blk_retry; /* transfer command state to send again on a new
+                              data connection after a 425, or 0 */
+  unsigned char blk_kept_ipver; /* CURLOPT_IPRESOLVE of the kept data conn */
+  BIT(blk_kept);    /* SECONDARYSOCKET is a kept block mode data connection */
+  BIT(blk_kept_active); /* the kept data connection was made with PORT */
+  BIT(blk_kept_ssl);    /* the kept data connection uses TLS */
+  BIT(blk_reused);  /* the current transfer reuses the kept connection */
+  BIT(blk_append);  /* the current upload command is APPE */
   BIT(ftp_trying_alternative);
   BIT(dont_check);  /* Set to TRUE to prevent the final (post-transfer)
                        file size and 226/250 status check. It should still

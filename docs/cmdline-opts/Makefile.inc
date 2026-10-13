@@ -107,6 +107,7 @@ DPAGES = \
   form.md \
   ftp-account.md \
   ftp-alternative-to-user.md \
+  ftp-block-mode.md \
   ftp-create-dirs.md \
   ftp-method.md \
   ftp-pasv.md \

@@ -348,6 +348,7 @@ void Curl_init_userdefined(struct Curl_easy *data)
   set->ftp_use_pret = FALSE;  /* mainly useful for drftpd servers */
   set->ftp_filemethod = FTPFILE_MULTICWD;
   set->ftp_skip_ip = TRUE;    /* skip PASV IP by default */
+  set->ftp_transfer_mode = (uint8_t)CURLFTPMODE_STREAM;
 #endif
   set->dns_cache_timeout_ms = 60000; /* Timeout every 60 seconds by default */
 
