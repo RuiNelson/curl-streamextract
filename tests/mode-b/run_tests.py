@@ -24,7 +24,8 @@
 #
 ###########################################################################
 """Tests for FTP block mode (CURLOPT_FTP_TRANSFER_MODE, --ftp-block-mode)
-against modeb_server.py, driving the curl tool and a small libcurl client.
+and FTPMC (CURLOPT_FTP_MC_CONNECTIONS, --ftp-mc) against modeb_server.py,
+driving the curl tool and a small libcurl client.
 
   python3 run_tests.py --build <cmake build dir> [-k NAME] [-v]
 
@@ -635,6 +636,177 @@ def test_info(env):
     srv = env.server(mode_b_reply='504 Unsupported transfer mode.')
     out = env.run_client(['info', 'block', url(srv)])
     check(out[0]['result'] == 0 and out[0]['mode'] == 0, out)
+
+
+# --- FTPMC (draft-ftpmc-00) ---------------------------------------------
+
+MC_SIZES = [0, 1, 4095, 4096, 16384, 16385, 3 * 16384 + 17, 2 * 1024 * 1024 + 3]
+
+
+def mc_check_log(srv, transfers):
+    check(srv.count('FEAT') == 1, 'FEAT sent %d times' % srv.count('FEAT'))
+    check(srv.count('OPTS') == 1, 'OPTS sent %d times' % srv.count('OPTS'))
+    check(srv.count('MPSV') == transfers, 'MPSV sent %d times, expected %d'
+          % (srv.count('MPSV'), transfers))
+    check(data_setups(srv) == 0, 'single connection setups: %d' %
+          data_setups(srv))
+
+
+def mc_roundtrip(env, srv, opts, sizes=MC_SIZES):
+    args, files = upload_args(env, srv, sizes, prefix='m')
+    env.run_curl(opts + args)
+    check_files(srv, files)
+    dl = []
+    outs = {}
+    for name in files:
+        outs[name] = os.path.join(env.tmp, 'mcdl-' + name)
+        dl += [url(srv, name), '-o', outs[name]]
+    env.run_curl(opts + dl)
+    for name, data in files.items():
+        if not data and not os.path.exists(outs[name]):
+            continue
+        with open(outs[name], 'rb') as f:
+            got = f.read()
+        check(got == data, '%s: %d bytes, expected %d' %
+              (name, len(got), len(data)))
+    return len(files)
+
+
+def test_mc_stream(env):
+    """FTPMC in stream mode: 4 connections, stripe 4096, one set per file"""
+    srv = env.server(mc_max=16)
+    n = mc_roundtrip(env, srv, ['--ftp-mc', '4'])
+    check(srv.log.count('OPTS MC 4') == 2, srv.log)  # once per curl run
+    check(srv.count('MPSV') == 2 * n, srv.log)
+    check(srv.events.count('mc-upload') == n, srv.events)
+    check(srv.events.count('mc-download') == n, srv.events)
+
+
+def test_mc_stripes(env):
+    """FTPMC: 1, 3 and 16 connections, stripes of 512, 1000 and 65536"""
+    for conns, stripe in ((1, 4096), (3, 1000), (16, 512), (2, 65536)):
+        srv = env.server(mc_max=16)
+        mc_roundtrip(env, srv, ['--ftp-mc', str(conns), '--ftp-mc-stripe',
+                                str(stripe)], sizes=[0, 7, 3 * stripe + 1,
+                                                     300001])
+        check(srv.log.count('OPTS MC %d %d' % (conns, stripe)) == 2,
+              srv.log)
+
+
+def test_mc_block(env):
+    """FTPMC in block mode: one set of connections for all transfers"""
+    srv = env.server(mc_max=16, listing=LISTING)
+    args, files = upload_args(env, srv, MC_SIZES, prefix='b')
+    outs = []
+    dl = []
+    for name in files:
+        outs.append(os.path.join(env.tmp, 'mcb-' + name))
+        dl += [url(srv, name), '-o', outs[-1]]
+    lst = os.path.join(env.tmp, 'mcb-list')
+    mc = ['--ftp-mc', '4']
+    env.run_curl(ops(mc + args, mc + dl + [url(srv), '-o', lst]))
+    check_files(srv, files)
+    for (name, data), out in zip(files.items(), outs):
+        if not data and not os.path.exists(out):
+            continue
+        with open(out, 'rb') as f:
+            check(f.read() == data, '%s differs' % name)
+    with open(lst, 'rb') as f:
+        check(f.read() in (LISTING, LISTING.replace(b'\r\n', b'\n')),
+              'listing differs')
+    mc_check_log(srv, 1)
+    check(srv.events.count('reuse') == 2 * len(files), srv.events)
+
+
+def test_mc_resume(env):
+    """FTPMC: resumed download and upload, append"""
+    data = os.urandom(200001)
+    srv = env.server(mc_max=8, files={'r': data})
+    out = env.file('mc-r', data[:70000])
+    env.run_curl(['--ftp-mc', '3', '-C', '-', url(srv, 'r'), '-o', out])
+    with open(out, 'rb') as f:
+        check(f.read() == data, 'resumed download differs')
+    path = os.path.join(srv.root, 'u')
+    with open(path, 'wb') as f:
+        f.write(data[:12345])
+    env.run_curl(['--ftp-mc', '3', '-C', '-', '-T', env.file('mc-u', data),
+                  url(srv, 'u')])
+    with open(path, 'rb') as f:
+        check(f.read() == data, 'resumed upload differs')
+    env.run_curl(['--ftp-mc', '3', '--append', '-T', env.file('mc-a', b'xyz'),
+                  url(srv, 'u')])
+    with open(path, 'rb') as f:
+        check(f.read() == data + b'xyz', 'append differs')
+
+
+def test_mc_ftps(env):
+    """FTPMC over FTPS (PROT P): a TLS session on each data connection"""
+    if not env.tls_ctx:
+        raise Skip('no openssl to make a certificate')
+    tls = ['--ssl-reqd', '-k', '--ftp-mc', '4']
+    srv = env.server(mc_max=16)
+    mc_roundtrip(env, srv, tls, sizes=[0, 5, 100000])
+    check('PROT P' in srv.log, srv.log)
+    srv = env.server(mc_max=16)
+    mc_roundtrip(env, srv, tls + ['--ftp-block-mode'], sizes=[0, 5, 100000])
+    check(srv.count('MPSV') == 2, srv.log)  # one set per curl run
+
+
+def test_mc_no_server_support(env):
+    """FTPMC not in FEAT: one data connection, FEAT asked once"""
+    srv = env.server()
+    mc_roundtrip(env, srv, ['--ftp-mc', '4'], sizes=[10, 70000])
+    check(srv.count('FEAT') == 2, srv.log)  # once per curl run
+    check(srv.count('OPTS') == 0 and srv.count('MPSV') == 0, srv.log)
+    check(srv.count('EPSV') == 4, srv.log)
+
+
+def test_mc_refused(env):
+    """OPTS MC or MPSV refused: one data connection"""
+    srv = env.server(mc_max=8, mc_opts_reply='501 No.')
+    mc_roundtrip(env, srv, ['--ftp-mc', '4'], sizes=[10, 70000])
+    check(srv.count('OPTS') == 2 and srv.count('MPSV') == 0, srv.log)
+    srv = env.server(mc_max=8, mpsv_reply='502 Not now.')
+    mc_roundtrip(env, srv, ['--ftp-mc', '4'], sizes=[10, 70000])
+    check(srv.count('MPSV') == 4 and srv.count('EPSV') == 4, srv.log)
+
+
+def test_mc_server_limits(env):
+    """the server lowers N and the stripe size: curl uses its values"""
+    data = os.urandom(300000)
+    srv = env.server(mc_max=2, mc_max_stripe=1024, files={'x': data})
+    out = os.path.join(env.tmp, 'mc-lim')
+    env.run_curl(['--ftp-mc', '8', '--ftp-mc-stripe', '1M', url(srv, 'x'),
+                  '-o', out])
+    with open(out, 'rb') as f:
+        check(f.read() == data, 'download differs')
+    check('OPTS MC 2 1048576' in srv.log, srv.log)
+
+
+def test_mc_bad_mpsv(env):
+    """224 with the wrong number of ports: error"""
+    srv = env.server(mc_max=8, mpsv_ports=2, files={'x': b'abc'})
+    env.run_curl(['--ftp-mc', '4', url(srv, 'x'), '-o',
+                  os.path.join(env.tmp, 'mc-bad')], expect=13)
+
+
+def test_mc_early_close(env):
+    """a data connection ends early: the transfer fails"""
+    data = os.urandom(100000)
+    srv = env.server(mc_max=8, files={'x': data}, mc_early_close=True)
+    env.run_curl(['--ftp-mc', '4', url(srv, 'x'), '-o',
+                  os.path.join(env.tmp, 'mc-early')], expect=18)
+
+
+def test_mc_active(env):
+    """FTPMC with --ftp-port: one active data connection"""
+    srv = env.server(mc_max=8, files={'x': os.urandom(5000)})
+    out = os.path.join(env.tmp, 'mc-act')
+    env.run_curl(['--ftp-mc', '4', '-P', '127.0.0.1', url(srv, 'x'),
+                  '-o', out])
+    with open(out, 'rb') as f:
+        check(f.read() == srv.cfg.files['x'], 'download differs')
+    check(srv.count('MPSV') == 0 and srv.count('FEAT') == 0, srv.log)
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith('test_')]

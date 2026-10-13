@@ -4,11 +4,14 @@ Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
 SPDX-License-Identifier: curl
 -->
 
-# FTP block mode tests
+# FTP block mode and FTPMC tests
 
 Tests for FTP block mode (`MODE B`, RFC 959 section 3.4.2) with a kept and
 reused data connection: `CURLOPT_FTP_TRANSFER_MODE`,
-`CURLINFO_FTP_TRANSFER_MODE` and the `--ftp-block-mode` tool option.
+`CURLINFO_FTP_TRANSFER_MODE` and the `--ftp-block-mode` tool option. And for
+FTPMC (draft-ftpmc-00), one transfer over several data connections:
+`CURLOPT_FTP_MC_CONNECTIONS`, `CURLOPT_FTP_MC_STRIPE` and the `--ftp-mc` and
+`--ftp-mc-stripe` tool options (the `mc_` tests).
 
 - `modeb_server.py` is a small FTP server (Python 3 standard library) that
   implements block mode as the client expects it: `200` to `MODE B`, `125`
@@ -19,6 +22,11 @@ reused data connection: `CURLOPT_FTP_TRANSFER_MODE`,
   invalid descriptors, restart markers, headers split across writes, bytes
   after the end of file, closing an idle kept connection and slow reading.
   It supports explicit (`AUTH TLS`) and implicit FTPS, with `PROT P`.
+  For FTPMC it lists `MC` in `FEAT` when configured to, and implements
+  `OPTS MC` and `MPSV`, striping in stream and block mode and a kept
+  connection set. It can refuse `OPTS MC` or `MPSV`, send a `224` reply with
+  the wrong number of ports, lower the number of connections and the stripe
+  size, and end a data connection early.
 - `modeb_client.c` is a libcurl program for what the tool cannot show: the
   info value, payload-only byte counts and progress, and a read callback that
   aborts an upload.
