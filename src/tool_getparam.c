@@ -143,6 +143,8 @@ static const struct LongShort aliases[] = {
   {"ftp-alternative-to-user",    ARG_STRG, ' ', C_FTP_ALTERNATIVE_TO_USER},
   {"ftp-block-mode",             ARG_BOOL, ' ', C_FTP_BLOCK_MODE},
   {"ftp-create-dirs",            ARG_BOOL, ' ', C_FTP_CREATE_DIRS},
+  {"ftp-mc",                     ARG_STRG, ' ', C_FTP_MC},
+  {"ftp-mc-stripe",              ARG_STRG, ' ', C_FTP_MC_STRIPE},
   {"ftp-method",                 ARG_STRG, ' ', C_FTP_METHOD},
   {"ftp-pasv",                   ARG_NONE, ' ', C_FTP_PASV},
   {"ftp-port",                   ARG_STRG, 'P', C_FTP_PORT},
@@ -2598,6 +2600,18 @@ static ParameterError opt_string(struct OperationConfig *config,
     break;
   case C_HAPROXY_CLIENTIP: /* --haproxy-clientip */
     err = getstr(&config->haproxy_clientip, nextarg, DENY_BLANK);
+    break;
+  case C_FTP_MC: /* --ftp-mc */
+    err = str2unummax(&config->ftp_mc, nextarg, 64);
+    break;
+  case C_FTP_MC_STRIPE: /* --ftp-mc-stripe */
+    err = GetSizeParameter(nextarg, &value);
+    if(!err) {
+      if((value < 1) || (value > 0xffffffffL))
+        err = PARAM_NUMBER_TOO_LARGE;
+      else
+        config->ftp_mc_stripe = value;
+    }
     break;
   case C_MAX_FILESIZE: /* --max-filesize */
     err = GetSizeParameter(nextarg, &value);
