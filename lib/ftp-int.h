@@ -26,6 +26,7 @@
 #include "curl_setup.h"
 
 #include "pingpong.h"
+#include "ftp.h"
 
 #ifndef CURL_DISABLE_FTP
 
@@ -48,6 +49,8 @@ enum {
   FTP_NAMEFMT,
   FTP_MODE, /* MODE B at the end of the connect phase */
   FTP_MODE_XFER, /* MODE B before setting up a data connection */
+  FTP_MC_FEAT, /* FEAT, to learn if the server supports FTPMC */
+  FTP_MC_OPTS, /* OPTS MC, to set the FTPMC connections and stripe size */
   FTP_QUOTE, /* waiting for a response to a command sent in a quote list */
   FTP_RETR_PREQUOTE,
   FTP_STOR_PREQUOTE,
@@ -69,6 +72,7 @@ enum {
   FTP_PORT, /* generic state for PORT, LPRT and EPRT, check count1 */
   FTP_PRET, /* generic state for PRET RETR, PRET STOR and PRET LIST/NLST */
   FTP_PASV, /* generic state for PASV and EPSV, check count1 */
+  FTP_MPSV, /* FTPMC: MPSV, the passive ports of a connection set */
   FTP_LIST, /* generic state for LIST, NLST or a custom list command */
   FTP_RETR,
   FTP_STOR, /* generic state for STOR and APPE */
@@ -102,6 +106,14 @@ struct FTP {
 #define FTP_BLK_ON      1 /* server accepted MODE B */
 #define FTP_BLK_OFF     2 /* server refused MODE B, stream mode */
 
+/* ftp_conn->mc_state values: what the server said about FTPMC */
+#define FTP_MC_UNKNOWN 0 /* FEAT not sent on this connection */
+#define FTP_MC_NONE    1 /* the server does not support FTPMC */
+#define FTP_MC_AVAIL   2 /* supported, not enabled (or OPTS MC refused) */
+#define FTP_MC_ON      3 /* enabled with mc_n connections, mc_stripe */
+
+struct cf_ftp_mc_ctx;
+
 /* one struct entry for each path component (of 'rawpath') */
 struct pathcomp {
   int start; /* start column */
@@ -123,6 +135,7 @@ struct ftp_conn {
                         and others (A/I or zero) */
   char *server_os;     /* The target server operating system. */
   char *blk_kept_port; /* CURLOPT_FTPPORT of the kept data connection */
+  struct cf_ftp_mc_ctx *mc_pend; /* connection set being connected */
   curl_off_t known_filesize; /* file size is different from -1, if wildcard
                                 LIST parsing was done and wc_statemach set
                                 it */
@@ -143,6 +156,14 @@ struct ftp_conn {
   unsigned char blk_retry; /* transfer command state to send again on a new
                               data connection after a 425, or 0 */
   unsigned char blk_kept_ipver; /* CURLOPT_IPRESOLVE of the kept data conn */
+  unsigned char mc_state; /* FTP_MC_* */
+  unsigned char mc_max;   /* the largest N the server accepts (FEAT) */
+  unsigned char mc_n;     /* connections in effect (OPTS MC reply) */
+  unsigned char mc_want_n; /* connections asked for with OPTS MC */
+  unsigned char mc_next;  /* index of the connection being connected */
+  uint32_t mc_stripe;     /* stripe size in effect (OPTS MC reply) */
+  uint32_t mc_want_stripe; /* stripe size asked for with OPTS MC */
+  unsigned short mc_ports[CURL_FTP_MC_MAX_CONNECTIONS]; /* MPSV reply */
   BIT(blk_kept);    /* SECONDARYSOCKET is a kept block mode data connection */
   BIT(blk_kept_active); /* the kept data connection was made with PORT */
   BIT(blk_kept_ssl);    /* the kept data connection uses TLS */

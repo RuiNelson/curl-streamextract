@@ -73,6 +73,8 @@
 --ftp-alternative-to-user            7.15.5
 --ftp-block-mode                     8.23.0
 --ftp-create-dirs                    7.10.7
+--ftp-mc                             8.23.0
+--ftp-mc-stripe                      8.23.0
 --ftp-method                         7.15.1
 --ftp-pasv                           7.11.0
 --ftp-port (-P)                      4.0

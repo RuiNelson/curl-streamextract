@@ -102,6 +102,8 @@ static const char * const ftp_state_names[] = {
   "NAMEFMT",
   "MODE",
   "MODE_XFER",
+  "MC_FEAT",
+  "MC_OPTS",
   "QUOTE",
   "RETR_PREQUOTE",
   "STOR_PREQUOTE",
@@ -123,6 +125,7 @@ static const char * const ftp_state_names[] = {
   "PORT",
   "PRET",
   "PASV",
+  "MPSV",
   "LIST",
   "RETR",
   "STOR",
@@ -174,6 +177,12 @@ static CURLcode ftp_nb_type(struct Curl_easy *data,
                             bool ascii, ftpstate newstate);
 static CURLcode getftpresponse(struct Curl_easy *data, size_t *nreadp,
                                int *ftpcodep);
+static CURLcode ftp_state_use_pasv(struct Curl_easy *data,
+                                   struct ftp_conn *ftpc,
+                                   struct connectdata *conn);
+static CURLcode ftp_control_addr_dup(struct Curl_easy *data, char **newhostp);
+static void ftp_mc_discard_pending(struct Curl_easy *data,
+                                   struct ftp_conn *ftpc);
 
 static void freedirs(struct ftp_conn *ftpc)
 {
@@ -354,6 +363,7 @@ static void close_secondarysocket(struct Curl_easy *data,
                                   struct ftp_conn *ftpc)
 {
   CURL_TRC_FTP(data, "[%s] closing DATA connection", FTP_CSTATE(ftpc));
+  ftp_mc_discard_pending(data, ftpc);
   Curl_conn_cf_discard_all(data, data->conn, SECONDARYSOCKET);
   ftpc->blk_kept = FALSE;
 }
@@ -831,6 +841,865 @@ static bool ftp_blk_idle_check(struct Curl_easy *data,
     CURLE_AGAIN;
 }
 
+/***********************************************************************
+ *
+ * FTPMC: one transfer over several data connections (draft-ftpmc-00)
+ *
+ * After FEAT lists "MC" and OPTS MC sets N connections and a stripe size S,
+ * MPSV makes the server listen on N ports. The data stream is cut into
+ * stripes of S bytes and stripe i travels on connection i mod N, with no
+ * header: both sides know N and S.
+ *
+ * The N data connections are connected one after the other with the usual
+ * SECONDARYSOCKET machinery (including TLS for protected data), then each
+ * filter chain is taken out of SECONDARYSOCKET. A connection filter that
+ * owns all of them is put there instead, so the transfer sees one data
+ * connection. It sends the stripes round-robin and puts received stripes
+ * back in order. Every connection has a buffer of at least 2 * S bytes:
+ * received data waits there until its turn, and data to send waits there
+ * until its connection takes it, so that one slow connection does not stop
+ * the others.
+ *
+ * The first connection that ends before completing its stripe ends the
+ * data stream; every other connection must then be at its end too,
+ * otherwise data was lost and the transfer fails.
+ */
+#define FTP_MC_BUF_MIN (256 * 1024) /* buffer of each connection, minimum */
+
+struct ftp_mc_sub {
+  struct Curl_cfilter *cf; /* the filter chain of this data connection */
+  unsigned char *buf;      /* received data ahead of its turn, or data
+                              waiting to be sent */
+  size_t head;             /* ring buffer start */
+  size_t len;              /* bytes in the ring buffer */
+  BIT(eof);                /* end of data received */
+  BIT(eos_sent);           /* end of data passed to the chain */
+};
+
+struct cf_ftp_mc_ctx {
+  struct ftp_mc_sub *sub;
+  size_t n;            /* number of data connections */
+  size_t stripe;       /* stripe size */
+  size_t bufsize;      /* ring buffer size of each connection */
+  curl_off_t rpos;     /* bytes of the data stream received */
+  curl_off_t spos;     /* bytes of the data stream accepted to send */
+  BIT(ending);         /* a connection ended mid-stripe: the end is here */
+  BIT(eof_told);       /* end of the data stream reported */
+  BIT(send_eos);       /* the whole data stream is accepted to send */
+};
+
+static void cf_ftp_mc_ctx_free(struct cf_ftp_mc_ctx *ctx,
+                               struct Curl_easy *data)
+{
+  size_t i;
+  if(!ctx)
+    return;
+  for(i = 0; i < ctx->n; i++) {
+    Curl_conn_cf_discard_chain(&ctx->sub[i].cf, data);
+    curlx_free(ctx->sub[i].buf);
+  }
+  curlx_free(ctx->sub);
+  curlx_free(ctx);
+}
+
+static struct cf_ftp_mc_ctx *cf_ftp_mc_ctx_new(size_t n, size_t stripe)
+{
+  struct cf_ftp_mc_ctx *ctx = curlx_calloc(1, sizeof(*ctx));
+  if(!ctx)
+    return NULL;
+  ctx->sub = curlx_calloc(n, sizeof(*ctx->sub));
+  if(!ctx->sub) {
+    curlx_free(ctx);
+    return NULL;
+  }
+  ctx->n = n;
+  ctx->stripe = stripe;
+  ctx->bufsize = CURLMAX(2 * stripe, FTP_MC_BUF_MIN);
+  return ctx;
+}
+
+static void cf_ftp_mc_destroy(struct Curl_cfilter *cf,
+                              struct Curl_easy *data)
+{
+  cf_ftp_mc_ctx_free(cf->ctx, data);
+}
+
+/* the connection that carries stream byte pos */
+static size_t ftp_mc_index(const struct cf_ftp_mc_ctx *ctx, curl_off_t pos)
+{
+  return (size_t)((pos / (curl_off_t)ctx->stripe) % (curl_off_t)ctx->n);
+}
+
+/* bytes from pos to the end of its stripe */
+static size_t ftp_mc_stripe_left(const struct cf_ftp_mc_ctx *ctx,
+                                 curl_off_t pos)
+{
+  return ctx->stripe - (size_t)(pos % (curl_off_t)ctx->stripe);
+}
+
+static CURLcode ftp_mc_sub_buf(struct cf_ftp_mc_ctx *ctx,
+                               struct ftp_mc_sub *s)
+{
+  if(!s->buf) {
+    s->buf = curlx_malloc(ctx->bufsize);
+    if(!s->buf)
+      return CURLE_OUT_OF_MEMORY;
+  }
+  return CURLE_OK;
+}
+
+/* Finish connecting a data connection (a TLS handshake that the server
+   starts after the transfer command). *done is TRUE when connected. */
+static CURLcode ftp_mc_sub_connect(struct ftp_mc_sub *s,
+                                   struct Curl_easy *data, bool *done)
+{
+  *done = s->cf->connected;
+  if(*done)
+    return CURLE_OK;
+  return Curl_conn_cf_connect(s->cf, data, done);
+}
+
+/* Read what the connections have, except connection skip, into their
+   buffers until the buffers are full or the connections have nothing
+   more. */
+static CURLcode ftp_mc_fill(struct cf_ftp_mc_ctx *ctx,
+                            struct Curl_easy *data, size_t skip)
+{
+  size_t i;
+
+  for(i = 0; i < ctx->n; i++) {
+    struct ftp_mc_sub *s = &ctx->sub[i];
+    bool connected;
+    CURLcode result;
+
+    if((i == skip) || s->eof)
+      continue;
+    result = ftp_mc_sub_connect(s, data, &connected);
+    if(result)
+      return result;
+    if(!connected)
+      continue;
+    result = ftp_mc_sub_buf(ctx, s);
+    if(result)
+      return result;
+    while(s->len < ctx->bufsize) {
+      size_t tail = (s->head + s->len) % ctx->bufsize;
+      size_t room = CURLMIN(ctx->bufsize - s->len, ctx->bufsize - tail);
+      size_t n;
+      result = Curl_conn_cf_recv(s->cf, data, (char *)&s->buf[tail], room,
+                                 &n);
+      if(result == CURLE_AGAIN)
+        break;
+      if(result)
+        return result;
+      if(!n) {
+        s->eof = TRUE;
+        break;
+      }
+      s->len += n;
+    }
+  }
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_mc_recv(struct Curl_cfilter *cf,
+                               struct Curl_easy *data,
+                               char *buf, size_t len, size_t *pnread)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  CURLcode result;
+  size_t i;
+
+  *pnread = 0;
+  if(ctx->eof_told)
+    return CURLE_OK;
+
+  while(!ctx->ending) {
+    size_t k = ftp_mc_index(ctx, ctx->rpos);
+    struct ftp_mc_sub *s = &ctx->sub[k];
+    size_t want = CURLMIN(len, ftp_mc_stripe_left(ctx, ctx->rpos));
+    bool connected;
+    size_t n = 0;
+
+    if(!want)
+      return CURLE_AGAIN;
+    if(s->len) {
+      /* the next bytes are already here */
+      n = CURLMIN(want, CURLMIN(s->len, ctx->bufsize - s->head));
+      memcpy(buf, &s->buf[s->head], n);
+      s->head = (s->head + n) % ctx->bufsize;
+      s->len -= n;
+      ctx->rpos += n;
+      *pnread = n;
+      return CURLE_OK;
+    }
+    if(s->eof) {
+      ctx->ending = TRUE;
+      break;
+    }
+    result = ftp_mc_sub_connect(s, data, &connected);
+    if(!result && connected)
+      result = Curl_conn_cf_recv(s->cf, data, buf, want, &n);
+    else if(!result)
+      result = CURLE_AGAIN;
+    if(result == CURLE_AGAIN) {
+      /* keep the other connections flowing while this one waits */
+      result = ftp_mc_fill(ctx, data, k);
+      return result ? result : CURLE_AGAIN;
+    }
+    if(result)
+      return result;
+    if(!n) {
+      s->eof = TRUE;
+      ctx->ending = TRUE;
+      break;
+    }
+    ctx->rpos += n;
+    *pnread = n;
+    return CURLE_OK;
+  }
+
+  /* The data stream ends at rpos. Every connection must be at its end with
+     nothing left, or data was lost on a connection that closed early. */
+  result = ftp_mc_fill(ctx, data, ctx->n);
+  if(result)
+    return result;
+  for(i = 0; i < ctx->n; i++) {
+    if(ctx->sub[i].len) {
+      failf(data, "FTPMC: a data connection ended early, the transfer is "
+            "incomplete");
+      return CURLE_PARTIAL_FILE;
+    }
+  }
+  for(i = 0; i < ctx->n; i++) {
+    if(!ctx->sub[i].eof)
+      return CURLE_AGAIN;
+  }
+  CURL_TRC_CF(data, cf, "data stream ends after %" FMT_OFF_T " bytes",
+              ctx->rpos);
+  ctx->eof_told = TRUE;
+  return CURLE_OK;
+}
+
+/* Send what connection i has buffered, and the end of the data stream when
+   everything is sent. */
+static CURLcode ftp_mc_flush_sub(struct cf_ftp_mc_ctx *ctx,
+                                 struct Curl_easy *data, size_t i)
+{
+  struct ftp_mc_sub *s = &ctx->sub[i];
+  bool connected;
+  CURLcode result = ftp_mc_sub_connect(s, data, &connected);
+
+  if(result || !connected)
+    return result;
+  while(s->len) {
+    size_t n = CURLMIN(s->len, ctx->bufsize - s->head);
+    size_t nw;
+    result = Curl_conn_cf_send(s->cf, data, &s->buf[s->head], n, FALSE, &nw);
+    if(result == CURLE_AGAIN)
+      return CURLE_OK;
+    if(result)
+      return result;
+    s->head = (s->head + nw) % ctx->bufsize;
+    s->len -= nw;
+    if(nw < n)
+      return CURLE_OK;
+  }
+  if(ctx->send_eos && !s->eos_sent) {
+    if(s->cf->cft == &Curl_cft_ftp_blk) {
+      /* the block mode filter sends the end of file block */
+      static const uint8_t nothing = 0;
+      size_t nw;
+      result = Curl_conn_cf_send(s->cf, data, &nothing, 0, TRUE, &nw);
+      if(result == CURLE_AGAIN)
+        return CURLE_OK;
+      if(result)
+        return result;
+    }
+    /* in stream mode, closing the connection ends its data */
+    s->eos_sent = TRUE;
+  }
+  return result;
+}
+
+static CURLcode ftp_mc_flush(struct cf_ftp_mc_ctx *ctx,
+                             struct Curl_easy *data)
+{
+  size_t i;
+  for(i = 0; i < ctx->n; i++) {
+    CURLcode result = ftp_mc_flush_sub(ctx, data, i);
+    if(result)
+      return result;
+  }
+  return CURLE_OK;
+}
+
+static bool ftp_mc_needs_flush(struct cf_ftp_mc_ctx *ctx,
+                               struct Curl_easy *data)
+{
+  size_t i;
+  for(i = 0; i < ctx->n; i++) {
+    struct ftp_mc_sub *s = &ctx->sub[i];
+    if(s->len || (ctx->send_eos && !s->eos_sent) ||
+       Curl_conn_cf_needs_flush(s->cf, data))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static CURLcode cf_ftp_mc_send(struct Curl_cfilter *cf,
+                               struct Curl_easy *data,
+                               const uint8_t *buf, size_t len, bool eos,
+                               size_t *pnwritten)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  size_t done = 0;
+  CURLcode result;
+
+  *pnwritten = 0;
+  while(done < len) {
+    size_t k = ftp_mc_index(ctx, ctx->spos);
+    struct ftp_mc_sub *s = &ctx->sub[k];
+    size_t take = CURLMIN(len - done, ftp_mc_stripe_left(ctx, ctx->spos));
+    size_t tail, first;
+
+    result = ftp_mc_sub_buf(ctx, s);
+    if(result)
+      return result;
+    if(s->len == ctx->bufsize) {
+      result = ftp_mc_flush_sub(ctx, data, k);
+      if(result)
+        return result;
+      if(s->len == ctx->bufsize)
+        break; /* this connection takes no more for now */
+    }
+    take = CURLMIN(take, ctx->bufsize - s->len);
+    tail = (s->head + s->len) % ctx->bufsize;
+    first = CURLMIN(take, ctx->bufsize - tail);
+    memcpy(&s->buf[tail], buf + done, first);
+    memcpy(s->buf, buf + done + first, take - first);
+    s->len += take;
+    ctx->spos += take;
+    done += take;
+  }
+  if(eos && (done == len))
+    ctx->send_eos = TRUE;
+
+  result = ftp_mc_flush(ctx, data);
+  if(result)
+    return result;
+  *pnwritten = done;
+  return (!done && len) ? CURLE_AGAIN : CURLE_OK;
+}
+
+static bool cf_ftp_mc_data_pending(struct Curl_cfilter *cf,
+                                   const struct Curl_easy *data)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  const struct ftp_mc_sub *s = &ctx->sub[ftp_mc_index(ctx, ctx->rpos)];
+
+  if(ctx->eof_told)
+    return FALSE;
+  /* progress is possible without waiting for a socket */
+  return !ctx->ending &&
+    (s->len || s->eof || s->cf->cft->has_data_pending(s->cf, data));
+}
+
+static CURLcode cf_ftp_mc_adjust_pollset(struct Curl_cfilter *cf,
+                                         struct Curl_easy *data,
+                                         struct easy_pollset *ps)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  bool recv = Curl_req_want_recv(data);
+  bool send = Curl_req_want_send(data) && !ctx->send_eos;
+  size_t k = ftp_mc_index(ctx, ctx->rpos);
+  size_t ks = ftp_mc_index(ctx, ctx->spos);
+  size_t i;
+
+  for(i = 0; i < ctx->n; i++) {
+    struct ftp_mc_sub *s = &ctx->sub[i];
+    curl_socket_t sock = Curl_conn_cf_get_socket(s->cf, data);
+    CURLcode result = CURLE_OK;
+
+    if(sock == CURL_SOCKET_BAD)
+      continue;
+    if(s->cf->connected) {
+      /* wait for data where there is room for it, and for the room to send
+         on the connections that have data to send and on the one that takes
+         the next bytes of the transfer */
+      if(recv && !s->eof && ((i == k) || (s->len < ctx->bufsize)))
+        result = Curl_pollset_add_in(data, ps, sock);
+      else
+        result = Curl_pollset_remove_in(data, ps, sock);
+      if(!result) {
+        if(s->len || (ctx->send_eos && !s->eos_sent) || (send && (i == ks)))
+          result = Curl_pollset_add_out(data, ps, sock);
+        else
+          result = Curl_pollset_remove_out(data, ps, sock);
+      }
+    }
+    if(!result)
+      result = Curl_conn_cf_adjust_pollset(s->cf, data, ps);
+    if(result)
+      return result;
+  }
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_mc_connect(struct Curl_cfilter *cf,
+                                  struct Curl_easy *data, bool *done)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  size_t i;
+
+  *done = TRUE;
+  for(i = 0; i < ctx->n; i++) {
+    bool sdone;
+    CURLcode result = ftp_mc_sub_connect(&ctx->sub[i], data, &sdone);
+    if(result)
+      return result;
+    if(!sdone)
+      *done = FALSE;
+  }
+  return CURLE_OK;
+}
+
+/* Shut down a filter chain like the connection shutdown does */
+static CURLcode ftp_mc_sub_shutdown(struct Curl_cfilter *cf,
+                                    struct Curl_easy *data, bool *done)
+{
+  for(*done = FALSE; cf; cf = cf->next) {
+    if(cf->connected && !cf->shutdown) {
+      bool cfdone = FALSE;
+      CURLcode result = cf->cft->do_shutdown(cf, data, &cfdone);
+      if(result)
+        return result;
+      if(!cfdone)
+        return CURLE_OK;
+      cf->shutdown = TRUE;
+    }
+  }
+  *done = TRUE;
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_mc_shutdown(struct Curl_cfilter *cf,
+                                   struct Curl_easy *data, bool *done)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  CURLcode result;
+  size_t i;
+
+  *done = FALSE;
+  result = ftp_mc_flush(ctx, data);
+  if(result || ftp_mc_needs_flush(ctx, data))
+    return result;
+  *done = TRUE;
+  for(i = 0; i < ctx->n; i++) {
+    bool sdone;
+    result = ftp_mc_sub_shutdown(ctx->sub[i].cf, data, &sdone);
+    if(result)
+      return result;
+    if(!sdone)
+      *done = FALSE;
+  }
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_mc_cntrl(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                int event, int arg1, void *arg2)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  CURLcode result = CURLE_OK;
+  size_t i;
+
+  if(event == CF_CTRL_FLUSH)
+    result = ftp_mc_flush(ctx, data);
+  for(i = 0; !result && (i < ctx->n); i++)
+    result = Curl_conn_cf_cntrl(ctx->sub[i].cf, data, FALSE, event, arg1,
+                                arg2);
+  if(!result && (event == CF_CTRL_FLUSH)) {
+    if(ftp_mc_needs_flush(ctx, data))
+      /* the transfer must not end before every connection has sent all */
+      result = CURLE_AGAIN;
+    else
+      /* all sent: the transfer goes on now, there is no socket to wait for */
+      Curl_multi_mark_dirty(data);
+  }
+  return result;
+}
+
+static bool cf_ftp_mc_is_alive(struct Curl_cfilter *cf,
+                               struct Curl_easy *data,
+                               bool *input_pending)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  size_t i;
+
+  *input_pending = FALSE;
+  for(i = 0; i < ctx->n; i++) {
+    struct Curl_cfilter *sub = ctx->sub[i].cf;
+    bool pending = FALSE;
+    if(!sub->cft->is_alive(sub, data, &pending))
+      return FALSE;
+    if(pending)
+      *input_pending = TRUE;
+  }
+  return TRUE;
+}
+
+static CURLcode cf_ftp_mc_keep_alive(struct Curl_cfilter *cf,
+                                     struct Curl_easy *data)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  size_t i;
+
+  for(i = 0; i < ctx->n; i++) {
+    struct Curl_cfilter *sub = ctx->sub[i].cf;
+    CURLcode result = sub->cft->keep_alive(sub, data);
+    if(result)
+      return result;
+  }
+  return CURLE_OK;
+}
+
+static CURLcode cf_ftp_mc_query(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                int query, int *pres1, void *pres2)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  struct Curl_cfilter *first = ctx->sub[0].cf;
+  size_t i;
+
+  switch(query) {
+  case CF_QUERY_NEED_FLUSH:
+    if(ftp_mc_needs_flush(ctx, data)) {
+      *pres1 = TRUE;
+      return CURLE_OK;
+    }
+    break;
+  case CF_QUERY_REALLY_CONNECTED:
+    *pres1 = TRUE;
+    for(i = 0; i < ctx->n; i++) {
+      if(!Curl_conn_cf_is_ip_connected(ctx->sub[i].cf, data))
+        *pres1 = FALSE;
+    }
+    return CURLE_OK;
+  default:
+    /* the first data connection answers for the set */
+    return first->cft->query(first, data, query, pres1, pres2);
+  }
+  return Curl_cf_def_query(cf, data, query, pres1, pres2);
+}
+
+static const struct Curl_cftype Curl_cft_ftp_mc = {
+  "FTP-MC",
+  0,
+  CURL_LOG_LVL_NONE,
+  cf_ftp_mc_destroy,
+  cf_ftp_mc_connect,
+  cf_ftp_mc_shutdown,
+  cf_ftp_mc_adjust_pollset,
+  cf_ftp_mc_data_pending,
+  cf_ftp_mc_send,
+  cf_ftp_mc_recv,
+  cf_ftp_mc_cntrl,
+  cf_ftp_mc_is_alive,
+  cf_ftp_mc_keep_alive,
+  cf_ftp_mc_query,
+};
+
+/* the FTPMC filter of the data connection, or NULL */
+static struct Curl_cfilter *ftp_mc_cf(struct connectdata *conn)
+{
+  struct Curl_cfilter *cf = conn->cfilter[SECONDARYSOCKET];
+  return (cf && (cf->cft == &Curl_cft_ftp_mc)) ? cf : NULL;
+}
+
+/* Put a block mode filter on top of every data connection of the set */
+static CURLcode ftp_mc_blk_attach(struct Curl_easy *data,
+                                  struct cf_ftp_mc_ctx *ctx)
+{
+  size_t i;
+  for(i = 0; i < ctx->n; i++) {
+    struct cf_ftp_blk_ctx *bctx = curlx_calloc(1, sizeof(*bctx));
+    struct Curl_cfilter *cf;
+    CURLcode result;
+    if(!bctx)
+      return CURLE_OUT_OF_MEMORY;
+    result = Curl_cf_create(&cf, &Curl_cft_ftp_blk, bctx);
+    if(result) {
+      curlx_free(bctx);
+      return result;
+    }
+    cf->conn = data->conn;
+    cf->sockindex = SECONDARYSOCKET;
+    cf->connected = TRUE;
+    cf->next = ctx->sub[i].cf;
+    ctx->sub[i].cf = cf;
+  }
+  return CURLE_OK;
+}
+
+/* Get a kept block mode connection set ready for a new transfer */
+static void ftp_mc_reset(struct Curl_cfilter *cf)
+{
+  struct cf_ftp_mc_ctx *ctx = cf->ctx;
+  size_t i;
+  ctx->rpos = ctx->spos = 0;
+  ctx->ending = ctx->eof_told = ctx->send_eos = FALSE;
+  for(i = 0; i < ctx->n; i++) {
+    struct ftp_mc_sub *s = &ctx->sub[i];
+    s->head = s->len = 0;
+    s->eof = s->eos_sent = FALSE;
+    if(s->cf->cft == &Curl_cft_ftp_blk)
+      cf_ftp_blk_reset(s->cf->ctx);
+  }
+}
+
+/* Throw away a connection set that is not completely connected */
+static void ftp_mc_discard_pending(struct Curl_easy *data,
+                                   struct ftp_conn *ftpc)
+{
+  cf_ftp_mc_ctx_free(ftpc->mc_pend, data);
+  ftpc->mc_pend = NULL;
+}
+
+/* Is FTPMC wanted for this transfer, and possible on this connection? */
+static bool ftp_mc_wanted(struct Curl_easy *data, struct ftp_conn *ftpc)
+{
+  struct connectdata *conn = data->conn;
+  return data->set.ftp_mc_conns && !data->set.ftp_use_port &&
+    !data->set.ftp_use_pret &&
+    !conn->via_peer && !Curl_conn_is_tunneling(conn, FIRSTSOCKET) &&
+    (ftpc->mc_state != FTP_MC_NONE);
+}
+
+/* The connections and stripe size this transfer asks for */
+static unsigned char ftp_mc_want_n(struct Curl_easy *data,
+                                   struct ftp_conn *ftpc)
+{
+  return (unsigned char)CURLMIN(data->set.ftp_mc_conns,
+                                ftpc->mc_max ? ftpc->mc_max :
+                                CURL_FTP_MC_MAX_CONNECTIONS);
+}
+
+/* Does the transfer need FEAT or OPTS MC before setting up its data
+   connection? Sends it and changes state if so. */
+static CURLcode ftp_mc_negotiate(struct Curl_easy *data,
+                                 struct ftp_conn *ftpc, bool *sent)
+{
+  CURLcode result = CURLE_OK;
+  unsigned char n;
+
+  *sent = FALSE;
+  if(!ftp_mc_wanted(data, ftpc))
+    return CURLE_OK;
+  if(ftpc->mc_state == FTP_MC_UNKNOWN) {
+    ftpc->mc_max = 0;
+    result = Curl_pp_sendf(data, &ftpc->pp, "%s", "FEAT");
+    if(!result) {
+      ftp_state(data, ftpc, FTP_MC_FEAT);
+      *sent = TRUE;
+    }
+    return result;
+  }
+  n = ftp_mc_want_n(data, ftpc);
+  if((ftpc->mc_state == FTP_MC_ON) && (ftpc->mc_want_n == n) &&
+     (ftpc->mc_want_stripe == data->set.ftp_mc_stripe))
+    return CURLE_OK; /* already in effect */
+  if((ftpc->mc_state == FTP_MC_AVAIL) && (ftpc->mc_want_n == n) &&
+     (ftpc->mc_want_stripe == data->set.ftp_mc_stripe))
+    return CURLE_OK; /* already refused */
+  ftpc->mc_want_n = n;
+  ftpc->mc_want_stripe = data->set.ftp_mc_stripe;
+  if(ftpc->mc_want_stripe)
+    result = Curl_pp_sendf(data, &ftpc->pp, "OPTS MC %u %u", (unsigned int)n,
+                           (unsigned int)ftpc->mc_want_stripe);
+  else
+    result = Curl_pp_sendf(data, &ftpc->pp, "OPTS MC %u", (unsigned int)n);
+  if(!result) {
+    ftp_state(data, ftpc, FTP_MC_OPTS);
+    *sent = TRUE;
+  }
+  return result;
+}
+
+/* A line of the FEAT reply: " MC <max-conn>" */
+static void ftp_mc_feat_line(struct ftp_conn *ftpc, const char *line,
+                             size_t len)
+{
+  const char *p = line;
+  curl_off_t max;
+
+  if((len > 4) && !strncmp(p, " MC ", 4)) {
+    p += 4;
+    if(!curlx_str_number(&p, &max, 99999) && max)
+      ftpc->mc_max = (unsigned char)CURLMIN(max,
+                                            CURL_FTP_MC_MAX_CONNECTIONS);
+  }
+}
+
+/* The reply to OPTS MC: "200 MC <N> <S>" */
+static void ftp_mc_opts_resp(struct Curl_easy *data, struct ftp_conn *ftpc,
+                             int ftpcode)
+{
+  const char *p = curlx_dyn_ptr(&ftpc->pp.recvbuf) + 4;
+  curl_off_t n, s;
+
+  if((ftpcode == 200) && !strncmp(p, "MC ", 3)) {
+    p += 3;
+    if(!curlx_str_number(&p, &n, 99999) && !curlx_str_single(&p, ' ') &&
+       !curlx_str_number(&p, &s, 0xffffffff) && n && s &&
+       (n <= ftpc->mc_want_n)) {
+      ftpc->mc_state = FTP_MC_ON;
+      ftpc->mc_n = (unsigned char)n;
+      ftpc->mc_stripe = (uint32_t)s;
+      infof(data, "FTPMC: %u data connections, stripe size %u",
+            (unsigned int)ftpc->mc_n, (unsigned int)ftpc->mc_stripe);
+      return;
+    }
+  }
+  ftpc->mc_state = FTP_MC_AVAIL;
+  infof(data, "FTPMC: OPTS MC not accepted (%03d), using one data "
+        "connection", ftpcode);
+}
+
+/* Set up the filter chain of data connection index ftpc->mc_next at
+   SECONDARYSOCKET */
+static CURLcode ftp_mc_setup_sub(struct Curl_easy *data,
+                                 struct ftp_conn *ftpc)
+{
+  struct connectdata *conn = data->conn;
+  char *host = NULL;
+  CURLcode result = ftp_control_addr_dup(data, &host);
+
+  if(!result) {
+    Curl_peer_unlink(&conn->origin2);
+    result = Curl_peer_create(data, conn->scheme, host,
+                              ftpc->mc_ports[ftpc->mc_next], &conn->origin2);
+  }
+  curlx_free(host);
+  if(!result)
+    result = Curl_conn_setup(data, conn, SECONDARYSOCKET,
+                             conn->bits.ftp_use_data_ssl ?
+                             CURL_CF_SSL_ENABLE : CURL_CF_SSL_DISABLE);
+  return result;
+}
+
+/* The reply to MPSV: "224 Entering Multi-Passive Mode (|||p0,p1,...|)".
+   Anything else: fall back to one data connection for this transfer. */
+static CURLcode ftp_mc_mpsv_resp(struct Curl_easy *data,
+                                 struct ftp_conn *ftpc, int ftpcode)
+{
+  struct connectdata *conn = data->conn;
+  const char *ptr = strchr(curlx_dyn_ptr(&ftpc->pp.recvbuf), '(');
+  unsigned char count = 0;
+  CURLcode result;
+
+  if((ftpcode != 224) || !ptr) {
+    infof(data, "FTPMC: MPSV not accepted (%03d), using one data "
+          "connection", ftpcode);
+    return ftp_state_use_pasv(data, ftpc, conn);
+  }
+  ptr++;
+  if(ptr[0] && (ptr[1] == ptr[0]) && (ptr[2] == ptr[0])) {
+    char sep = ptr[0];
+    const char *p = &ptr[3];
+    for(;;) {
+      curl_off_t port;
+      if((count == ftpc->mc_n) || curlx_str_number(&p, &port, 0xffff) ||
+         !port)
+        break;
+      ftpc->mc_ports[count++] = (unsigned short)port;
+      if(*p == ',')
+        p++;
+      else if(*p == sep)
+        break;
+      else {
+        count = 0;
+        break;
+      }
+    }
+  }
+  if(count != ftpc->mc_n) {
+    failf(data, "FTPMC: weirdly formatted MPSV reply");
+    return CURLE_FTP_WEIRD_PASV_REPLY;
+  }
+
+  ftp_mc_discard_pending(data, ftpc);
+  ftpc->mc_pend = cf_ftp_mc_ctx_new(ftpc->mc_n, ftpc->mc_stripe);
+  if(!ftpc->mc_pend)
+    return CURLE_OUT_OF_MEMORY;
+  ftpc->mc_next = 0;
+  result = ftp_mc_setup_sub(data, ftpc);
+  if(result)
+    return result;
+  infof(data, "FTPMC: connecting %u data connections", (unsigned int)count);
+  conn->bits.do_more = TRUE;
+  ftp_state(data, ftpc, FTP_STOP); /* this phase is completed */
+  return CURLE_OK;
+}
+
+/* Connect the data connections of the set one after the other. When all of
+   them have their TCP connection, put the FTP-MC filter, which owns them,
+   at SECONDARYSOCKET. *ready is TRUE then. */
+static CURLcode ftp_mc_connect(struct Curl_easy *data,
+                               struct ftp_conn *ftpc, bool *ready)
+{
+  struct connectdata *conn = data->conn;
+  struct cf_ftp_mc_ctx *ctx = ftpc->mc_pend;
+  CURLcode result;
+
+  *ready = FALSE;
+  while(ftpc->mc_next < ctx->n) {
+    bool connected;
+    result = Curl_conn_connect(data, SECONDARYSOCKET, FALSE, &connected);
+    if(result) {
+      failf(data, "FTPMC: data connection %u failed",
+            (unsigned int)ftpc->mc_next);
+      return result;
+    }
+    if(!connected && !Curl_conn_is_ip_connected(data, SECONDARYSOCKET))
+      return CURLE_OK;
+    /* take the chain out of SECONDARYSOCKET, a TLS handshake goes on later */
+    ctx->sub[ftpc->mc_next].cf = conn->cfilter[SECONDARYSOCKET];
+    conn->cfilter[SECONDARYSOCKET] = NULL;
+    ftpc->mc_next++;
+    if(ftpc->mc_next < ctx->n) {
+      result = ftp_mc_setup_sub(data, ftpc);
+      if(result)
+        return result;
+    }
+  }
+
+  if(ftpc->blk_mode == FTP_BLK_ON) {
+    /* block mode framing on each data connection */
+    result = ftp_mc_blk_attach(data, ctx);
+    if(result)
+      return result;
+  }
+  {
+    struct Curl_cfilter *cf;
+    result = Curl_cf_create(&cf, &Curl_cft_ftp_mc, ctx);
+    if(result)
+      return result;
+    ftpc->mc_pend = NULL;
+    cf->connected = TRUE;
+    Curl_conn_cf_add(data, conn, SECONDARYSOCKET, cf);
+    /* the first data connection's socket is the SECONDARYSOCKET one. With
+       TLS, the chain is not connected yet and has not set it. */
+    (void)Curl_conn_cf_cntrl(ctx->sub[0].cf, data, TRUE,
+                             CF_CTRL_CONN_INFO_UPDATE, 0, NULL);
+  }
+  data->info.ftp_mc_conns = ftpc->mc_n;
+  CURL_TRC_FTP(data, "[%s] FTPMC: %u data connections ready",
+               FTP_CSTATE(ftpc), (unsigned int)ftpc->mc_n);
+  *ready = TRUE;
+  return CURLE_OK;
+}
+
 #ifdef CURL_PREFER_LF_LINEENDS
 /*
  * Lineend Conversions
@@ -1027,7 +1896,12 @@ static CURLcode ftp_initiate_transfer(struct Curl_easy *data,
   if(result || !connected)
     return result;
 
-  if(blk) {
+  if(blk && ftp_mc_cf(data->conn)) {
+    /* FTPMC in block mode: each data connection has its block filter */
+    ftp_mc_reset(ftp_mc_cf(data->conn));
+    data->info.ftp_mc_conns = ftpc->mc_n;
+  }
+  else if(blk) {
     /* block mode: the filter frames the data and marks the end of file, the
        data connection is not shut down at the end of the transfer */
     result = ftp_blk_attach(data);
@@ -1063,13 +1937,15 @@ static bool ftp_endofresp(struct Curl_easy *data, struct connectdata *conn,
                           const char *line, size_t len, int *code)
 {
   curl_off_t status;
+  struct ftp_conn *ftpc = Curl_conn_meta_get(conn, CURL_META_FTP_CONN);
   (void)data;
-  (void)conn;
 
   if((len > 3) && LASTLINE(line) && !curlx_str_number(&line, &status, 999)) {
     *code = (int)status;
     return TRUE;
   }
+  if(ftpc && (ftpc->state == FTP_MC_FEAT))
+    ftp_mc_feat_line(ftpc, line, len);
 
   return FALSE;
 }
@@ -1945,6 +2821,15 @@ static CURLcode ftp_state_data_setup(struct Curl_easy *data,
     /* We have chosen to use the PORT (or similar) command */
     result = ftp_state_use_port(data, ftpc, EPRT);
   }
+  else if((ftpc->mc_state == FTP_MC_ON) && ftp_mc_wanted(data, ftpc)) {
+    /* FTPMC: a set of passive data connections */
+    result = Curl_pp_sendf(data, &ftpc->pp, "%s", "MPSV");
+    if(!result) {
+      ftp_state(data, ftpc, FTP_MPSV);
+      infof(data, "Connect %u data streams passively",
+            (unsigned int)ftpc->mc_n);
+    }
+  }
   else {
     /* We have chosen (this is default) to use the PASV (or similar) command */
     if(data->set.ftp_use_pret) {
@@ -1978,17 +2863,32 @@ static bool ftp_strequal_or_null(const char *a, const char *b)
 static bool ftp_blk_reuse(struct Curl_easy *data, struct ftp_conn *ftpc)
 {
   struct connectdata *conn = data->conn;
-  struct Curl_cfilter *cf = ftp_blk_cf(conn);
+  struct Curl_cfilter *mc = ftp_mc_cf(conn);
+  struct Curl_cfilter *cf = mc ? NULL : ftp_blk_cf(conn);
   const char *port = data->set.ftp_use_port ?
     CURL_EASY_STR(data, STRING_FTPPORT) : NULL;
-  bool ok = cf && (ftpc->blk_mode == FTP_BLK_ON) &&
+  /* a kept FTPMC set serves transfers that want FTPMC, with the same
+     connections and stripe size */
+  bool want_mc = (ftpc->mc_state == FTP_MC_ON) && ftp_mc_wanted(data, ftpc);
+  bool ok = (cf || mc) && (ftpc->blk_mode == FTP_BLK_ON) &&
     Curl_conn_is_connected(conn, SECONDARYSOCKET) &&
     (!data->set.ftp_use_port == !ftpc->blk_kept_active) &&
     (!conn->bits.ftp_use_data_ssl == !ftpc->blk_kept_ssl) &&
     (data->set.ipver == ftpc->blk_kept_ipver) &&
-    ftp_strequal_or_null(port, ftpc->blk_kept_port);
+    ftp_strequal_or_null(port, ftpc->blk_kept_port) &&
+    (!mc == !want_mc);
 
-  if(ok && !ftp_blk_idle_check(data, cf)) {
+  if(ok && mc) {
+    struct cf_ftp_mc_ctx *ctx = mc->ctx;
+    size_t i;
+    ok = (ctx->n == ftpc->mc_n) && (ctx->stripe == ftpc->mc_stripe);
+    for(i = 0; ok && (i < ctx->n); i++)
+      ok = (ctx->sub[i].cf->cft == &Curl_cft_ftp_blk) &&
+        ftp_blk_idle_check(data, ctx->sub[i].cf);
+    if(!ok)
+      infof(data, "The kept FTPMC data connections are no longer usable");
+  }
+  else if(ok && !ftp_blk_idle_check(data, cf)) {
     infof(data, "The kept FTP data connection is no longer usable");
     ok = FALSE;
   }
@@ -2027,14 +2927,21 @@ static CURLcode ftp_state_prepare_transfer(struct Curl_easy *data,
     if(!result)
       ftp_state(data, ftpc, FTP_MODE_XFER);
   }
-  else if(ftpc->blk_kept && ftp_blk_reuse(data, ftpc)) {
-    /* no PORT or PASV, send the transfer command on the kept connection */
-    ftpc->blk_reused = TRUE;
-    data->conn->bits.do_more = TRUE;
-    ftp_state(data, ftpc, FTP_STOP); /* this phase is completed */
+  else {
+    bool sent;
+    /* FTPMC: FEAT and OPTS MC first, when needed */
+    result = ftp_mc_negotiate(data, ftpc, &sent);
+    if(result || sent)
+      ;
+    else if(ftpc->blk_kept && ftp_blk_reuse(data, ftpc)) {
+      /* no PORT or PASV, send the transfer command on the kept connection */
+      ftpc->blk_reused = TRUE;
+      data->conn->bits.do_more = TRUE;
+      ftp_state(data, ftpc, FTP_STOP); /* this phase is completed */
+    }
+    else
+      result = ftp_state_data_setup(data, ftpc);
   }
-  else
-    result = ftp_state_data_setup(data, ftpc);
   return result;
 }
 
@@ -2418,10 +3325,17 @@ static void ftp_blk_quote(struct Curl_easy *data, struct ftp_conn *ftpc,
     else
       return;
   }
+  else if(checkprefix("OPTS MC", cmd) || checkprefix("REIN", cmd)) {
+    /* the FTPMC state changed: OPTS MC again before the next MPSV */
+    if(ftpc->mc_state == FTP_MC_ON)
+      ftpc->mc_state = FTP_MC_AVAIL;
+    ftpc->mc_want_n = 0;
+  }
   else if(!checkprefix("PASV", cmd) && !checkprefix("EPSV", cmd) &&
           !checkprefix("LPSV", cmd) && !checkprefix("PORT", cmd) &&
           !checkprefix("EPRT", cmd) && !checkprefix("LPRT", cmd) &&
-          !checkprefix("ABOR", cmd) && !checkprefix("REIN", cmd))
+          !checkprefix("MPSV", cmd) && !checkprefix("MPRT", cmd) &&
+          !checkprefix("ABOR", cmd))
     return;
   if(ftpc->blk_kept && !ftpc->blk_reused)
     close_secondarysocket(data, ftpc);
@@ -2872,6 +3786,14 @@ static CURLcode ftp_do_more(struct Curl_easy *data, domore *more)
     return CURLE_FAILED_INIT;
 
   *more = DOMORE_INCOMPLETE; /* default to stay in the state */
+
+  if(ftpc->mc_pend) {
+    /* FTPMC: connect the data connections of the set */
+    bool ready;
+    result = ftp_mc_connect(data, ftpc, &ready);
+    if(result || !ready)
+      return result;
+  }
 
   /* if the second connection has been set up, try to connect it fully
    * to the remote host. This may not complete at this time, for several
@@ -4178,6 +5100,26 @@ static CURLcode ftp_pp_statemachine(struct Curl_easy *data,
     result = ftp_state_pasv_resp(data, ftpc, ftpcode);
     break;
 
+  case FTP_MPSV:
+    result = ftp_mc_mpsv_resp(data, ftpc, ftpcode);
+    break;
+
+  case FTP_MC_FEAT:
+    if(ftpc->mc_max)
+      ftpc->mc_state = FTP_MC_AVAIL;
+    else {
+      ftpc->mc_state = FTP_MC_NONE;
+      infof(data, "FTPMC: not supported by the server, using one data "
+            "connection");
+    }
+    result = ftp_state_prepare_transfer(data, ftpc, ftp);
+    break;
+
+  case FTP_MC_OPTS:
+    ftp_mc_opts_resp(data, ftpc, ftpcode);
+    result = ftp_state_prepare_transfer(data, ftpc, ftp);
+    break;
+
   case FTP_PORT:
     result = ftp_state_port_resp(data, ftpc, ftp, ftpcode);
     break;
@@ -4417,6 +5359,7 @@ static CURLcode ftp_done_secondary_socket(struct Curl_easy *data,
                                           CURLcode result)
 {
   struct connectdata *conn = data->conn;
+  ftp_mc_discard_pending(data, ftpc);
   if(Curl_conn_is_setup(conn, SECONDARYSOCKET)) {
     if(!result && ftpc->dont_check && data->req.maxdownload > 0) {
       /* partial download completed */
@@ -4493,6 +5436,54 @@ static CURLcode ftp_done_control_reply(struct Curl_easy *data,
   return result;
 }
 
+/* ftp_blk_done_data() for an FTPMC set: every data connection must have
+   sent or received its end of file block, with nothing left over */
+static bool ftp_mc_blk_done(struct Curl_easy *data, struct ftp_conn *ftpc,
+                            struct Curl_cfilter *mc, CURLcode *presult)
+{
+  struct cf_ftp_mc_ctx *ctx = mc->ctx;
+  size_t i;
+
+  if(data->state.upload) {
+    /* send what is still buffered, waiting (blocking) if needed */
+    ftpc->pp.response = *Curl_pgrs_now(data); /* timeout relative now */
+    for(;;) {
+      timediff_t left;
+      CURLcode result = cf_ftp_mc_cntrl(mc, data, CF_CTRL_FLUSH, 0, NULL);
+      if(result && (result != CURLE_AGAIN))
+        return FALSE;
+      if(!ftp_mc_needs_flush(ctx, data))
+        break;
+      left = Curl_pp_state_timeleft_ms(data, &ftpc->pp);
+      for(i = 0; i < ctx->n; i++) {
+        if(ctx->sub[i].len || !ctx->sub[i].eos_sent ||
+           Curl_conn_cf_needs_flush(ctx->sub[i].cf, data))
+          break;
+      }
+      if((left <= 0) || (i == ctx->n) ||
+         (ftp_blk_wait(ctx->sub[i].cf, data, TRUE, left) < 0)) {
+        failf(data, "FTPMC: failed to send all data");
+        return FALSE;
+      }
+    }
+  }
+  for(i = 0; i < ctx->n; i++) {
+    struct ftp_mc_sub *sub = &ctx->sub[i];
+    bool keep;
+    if((sub->cf->cft != &Curl_cft_ftp_blk) || sub->len)
+      return FALSE;
+    if(data->state.upload) {
+      if(!sub->eos_sent || !ftp_blk_send_eof(data, ftpc, sub->cf))
+        return FALSE;
+      continue;
+    }
+    *presult = ftp_blk_recv_eof(data, ftpc, sub->cf, &keep);
+    if(*presult || !keep)
+      return FALSE;
+  }
+  return TRUE;
+}
+
 /*
  * In block mode, check if the data connection of a transfer that went well
  * can be kept for the next one, pending the final reply: the end of file
@@ -4503,16 +5494,19 @@ static bool ftp_blk_done_data(struct Curl_easy *data, struct ftp_conn *ftpc,
                               CURLcode result, bool premature,
                               CURLcode *presult)
 {
-  struct Curl_cfilter *cf = ftp_blk_cf(data->conn);
+  struct Curl_cfilter *mc = ftp_mc_cf(data->conn);
+  struct Curl_cfilter *cf = mc ? NULL : ftp_blk_cf(data->conn);
   bool keep;
 
   *presult = CURLE_OK;
-  if(!cf || status || result || premature ||
+  if((!cf && !mc) || status || result || premature ||
      (ftpc->blk_mode != FTP_BLK_ON) ||
      (ftp->transfer != PPTRANSFER_BODY) || !ftpc->ctl_valid ||
      !ftpc->pp.pending_resp ||
      (ftpc->dont_check && (data->req.maxdownload > 0)))
     return FALSE;
+  if(mc)
+    return ftp_mc_blk_done(data, ftpc, mc, presult);
   if(data->state.upload)
     /* if the end of file is not sent, the server reports the failure */
     return ftp_blk_send_eof(data, ftpc, cf);
@@ -5115,6 +6109,7 @@ static CURLcode ftp_disconnect(struct Curl_easy *data,
      ftp_quit() will check the state of ftp->ctl_valid. If it is ok it
      will try to send the QUIT command, otherwise it will return. */
   ftpc->shutdown = TRUE;
+  ftp_mc_discard_pending(data, ftpc);
   if(dead_connection || Curl_pp_needs_flush(data, &ftpc->pp))
     ftpc->ctl_valid = FALSE;
 

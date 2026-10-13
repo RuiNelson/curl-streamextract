@@ -72,6 +72,7 @@ void Curl_initinfo(struct Curl_easy *data)
   info->conn_protocol = 0;
   info->used_proxy = 0;
   info->ftp_transfer_mode = 0;
+  info->ftp_mc_conns = 0;
 
 #ifdef USE_SSL
   Curl_ssl_free_certinfo(data);
@@ -404,6 +405,9 @@ static CURLcode getinfo_long(struct Curl_easy *data, CURLINFO info,
     break;
   case CURLINFO_FTP_TRANSFER_MODE:
     *param_longp = (long)data->info.ftp_transfer_mode;
+    break;
+  case CURLINFO_FTP_MC_CONNECTIONS:
+    *param_longp = (long)data->info.ftp_mc_conns;
     break;
   default:
     return CURLE_UNKNOWN_OPTION;

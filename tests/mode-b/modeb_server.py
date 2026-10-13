@@ -24,8 +24,10 @@
 #
 ###########################################################################
 """A small FTP server implementing block mode (MODE B, RFC 959 3.4.2) with
-a kept data connection, as specified for curl's CURLFTPMODE_BLOCK, plus
-fault injection for tests. Python 3 standard library only.
+a kept data connection, as specified for curl's CURLFTPMODE_BLOCK, and
+FTPMC (draft-ftpmc-00: FEAT "MC", OPTS MC, MPSV, a transfer striped over N
+data connections), plus fault injection for tests. Python 3 standard
+library only.
 
 Wire format: 3-byte header (descriptor, 16-bit big-endian length) and the
 payload. EOF is descriptor 0x40. A successful block mode transfer keeps the
@@ -74,6 +76,14 @@ class Config:
         self.listing = b''               # LIST/NLST payload
         self.tls_ctx = None              # server ssl.SSLContext for FTPS
         self.implicit_tls = False        # TLS from the start (ftps://)
+        # FTPMC
+        self.mc_max = 0                  # FEAT " MC <max>", 0: no FEAT MC
+        self.mc_max_stripe = 1 << 20     # larger stripes are lowered
+        self.mc_opts_reply = None        # reply to OPTS MC instead of 200
+        self.mpsv_reply = None           # reply to MPSV instead of 224
+        self.mpsv_ports = None           # number of ports in the 224 reply
+        self.mc_early_close = False      # download: connection 1 ends after
+                                         # its first stripe
 
 
 class Session:
@@ -89,6 +99,8 @@ class Session:
         self.rest = 0
         self.cwd = '/'
         self.xfers = 0            # transfer commands so far
+        self.mc_n = 0             # FTPMC connections, 0: disabled
+        self.mc_stripe = 4096
         self.log = server.log
         self.events = server.events
 
@@ -107,21 +119,41 @@ class Session:
 
     def close_kept(self):
         if self.kept:
-            try:
-                self.kept.close()
-            except OSError:
-                pass
+            for k in (self.kept if isinstance(self.kept, list)
+                      else [self.kept]):
+                try:
+                    k.close()
+                except OSError:
+                    pass
             self.kept = None
 
     def close_pending(self):
         if self.pending and self.pending[0] == 'pasv':
             self.pending[1].close()
+        if self.pending and self.pending[0] == 'mpsv':
+            for lst in self.pending[1]:
+                lst.close()
         self.pending = None
 
     # data connection
     def open_data(self):
         kind, what = self.pending
         self.pending = None
+        if kind == 'mpsv':
+            # all connections first, then the TLS handshakes in parallel
+            socks = []
+            for lst in what:
+                lst.settimeout(10)
+                s, _ = lst.accept()
+                lst.close()
+                s.settimeout(30)
+                socks.append(s)
+            if self.prot_p:
+                socks = mc_parallel(
+                    lambda s: self.cfg.tls_ctx.wrap_socket(s,
+                                                           server_side=True),
+                    socks)
+            return socks
         if kind == 'pasv':
             what.settimeout(10)
             s, _ = what.accept()
@@ -175,6 +207,12 @@ class Session:
         return s
 
     def finish_ok(self, s):
+        if isinstance(s, list) and not (self.block and
+                                        not self.cfg.reply_226):
+            for c in s:
+                self.shutdown_data(c)
+            self.reply('226 Transfer complete.')
+            return
         if self.block and not self.cfg.reply_226:
             self.kept = s
             self.reply('250 Transfer complete.')
@@ -205,10 +243,11 @@ class Session:
             pass
 
     def fail(self, s, line):
-        try:
-            s.close()
-        except OSError:
-            pass
+        for c in (s if isinstance(s, list) else [s]):
+            try:
+                c.close()
+            except OSError:
+                pass
         self.reply(line)
 
     # block mode framing
@@ -287,6 +326,9 @@ class Session:
             return
         path = os.path.join(self.server.root, name.lstrip('/'))
         parts = []
+        if isinstance(s, list):
+            self.mc_upload(s, path, append)
+            return
         try:
             if self.block:
                 self.recv_blocks(s, parts)
@@ -319,6 +361,9 @@ class Session:
         s, reused = self.get_data_conn()
         if not s:
             return
+        if isinstance(s, list):
+            self.mc_download(s, data)
+            return
         try:
             if self.block:
                 self.send_blocks(s, data)
@@ -332,6 +377,52 @@ class Session:
             self.fail(s, '426 Connection closed; transfer aborted.')
             return
         self.finish_ok(s)
+
+    # FTPMC
+    def mc_upload(self, socks, path, append):
+        def recv_all(s):
+            out = []
+            if self.block:
+                self.recv_blocks(s, out)
+            else:
+                while True:
+                    d = s.recv(65536)
+                    if not d:
+                        break
+                    out.append(d)
+            return b''.join(out)
+        try:
+            parts = mc_parallel(recv_all, socks)
+            data = mc_join(parts, self.mc_stripe)
+        except (Truncated, BadDescriptor, ValueError, OSError):
+            self.events.append('mc-upload-failed')
+            self.fail(socks, '426 Connection closed; transfer aborted.')
+            return
+        self.write_file(path, [data], append)
+        self.events.append('mc-upload')
+        self.finish_ok(socks)
+
+    def mc_download(self, socks, data):
+        parts = mc_split(data, len(socks), self.mc_stripe)
+        if self.cfg.mc_early_close and len(socks) > 1:
+            parts[1] = parts[1][:self.mc_stripe]
+
+        def send(sp):
+            s, part = sp
+            if self.block:
+                self.send_blocks(s, part)
+            else:
+                s.sendall(part)
+                if self.cfg.mc_early_close:
+                    self.shutdown_data(s)
+            return None
+        try:
+            mc_parallel(send, list(zip(socks, parts)))
+        except OSError:
+            self.fail(socks, '426 Connection closed; transfer aborted.')
+            return
+        self.events.append('mc-download')
+        self.finish_ok(socks)
 
     def handle(self):
         self.reply('220 MODE B test server')
@@ -444,6 +535,32 @@ class Session:
             self.do_transfer_download(cfg.listing)
         elif cmd == 'DELE':
             self.reply('250 Deleted.')
+        elif cmd == 'FEAT':
+            if cfg.mc_max:
+                self.ctrl.sendall(('211-Features:\r\n SIZE\r\n MC %d\r\n'
+                                   '211 End\r\n' % cfg.mc_max).encode())
+            else:
+                self.reply('500 Unknown command.')
+        elif cmd == 'OPTS' and arg.upper().startswith('MC'):
+            self.do_opts_mc(arg[2:].split())
+        elif cmd == 'MPSV':
+            self.close_kept()
+            self.close_pending()
+            if cfg.mpsv_reply or not self.mc_n:
+                self.reply(cfg.mpsv_reply or '503 Use OPTS MC first.')
+            else:
+                lsts = []
+                for _ in range(self.mc_n):
+                    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    lst.bind(('127.0.0.1', 0))
+                    lst.listen(1)
+                    lsts.append(lst)
+                self.pending = ('mpsv', lsts)
+                ports = [str(x.getsockname()[1]) for x in lsts]
+                if cfg.mpsv_ports is not None:
+                    ports = ports[:cfg.mpsv_ports]
+                self.reply('224 Entering Multi-Passive Mode (|||%s|)' %
+                           ','.join(ports))
         elif cmd == 'NOOP':
             self.reply('200 NOOP ok.')
         elif cmd == 'QUIT':
@@ -452,6 +569,70 @@ class Session:
         else:
             self.reply('500 Unknown command.')
         return True
+
+
+    def do_opts_mc(self, words):
+        cfg = self.cfg
+        self.close_kept()
+        if not cfg.mc_max:
+            self.reply('501 Option not supported.')
+        elif cfg.mc_opts_reply:
+            self.reply(cfg.mc_opts_reply)
+        elif words and words[0].upper() == 'OFF':
+            self.mc_n = 0
+            self.reply('200 MC OFF')
+        elif (len(words) in (1, 2) and all(w.isdigit() for w in words) and
+              int(words[0])):
+            self.mc_n = min(int(words[0]), cfg.mc_max)
+            if len(words) == 2:
+                self.mc_stripe = min(max(int(words[1]), 1),
+                                     cfg.mc_max_stripe)
+            self.reply('200 MC %d %d' % (self.mc_n, self.mc_stripe))
+        else:
+            self.reply('501 Usage: OPTS MC <N> [<S>]')
+
+
+def mc_parallel(func, items):
+    """func(item) for every item, each in its own thread."""
+    results = [None] * len(items)
+    errors = []
+
+    def run(i):
+        try:
+            results[i] = func(items[i])
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    threads = [threading.Thread(target=run, args=(i,))
+               for i in range(len(items))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    if errors:
+        raise errors[0]
+    return results
+
+
+def mc_split(data, n, stripe):
+    parts = [bytearray() for _ in range(n)]
+    for i in range(0, len(data), stripe):
+        parts[(i // stripe) % n] += data[i:i + stripe]
+    return [bytes(p) for p in parts]
+
+
+def mc_join(parts, stripe):
+    """The receiver of draft-ftpmc Section 6.2; ValueError if inconsistent"""
+    out, pos, i, n = bytearray(), [0] * len(parts), 0, len(parts)
+    while True:
+        k = i % n
+        chunk = parts[k][pos[k]:pos[k] + stripe]
+        pos[k] += len(chunk)
+        out += chunk
+        if len(chunk) < stripe:
+            if any(p != len(part) for p, part in zip(pos, parts)):
+                raise ValueError('inconsistent stripes')
+            return bytes(out)
+        i += 1
 
 
 class Server:

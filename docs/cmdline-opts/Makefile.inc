@@ -109,6 +109,8 @@ DPAGES = \
   ftp-alternative-to-user.md \
   ftp-block-mode.md \
   ftp-create-dirs.md \
+  ftp-mc.md \
+  ftp-mc-stripe.md \
   ftp-method.md \
   ftp-pasv.md \
   ftp-port.md \

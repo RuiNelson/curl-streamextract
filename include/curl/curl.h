@@ -2301,6 +2301,12 @@ typedef enum {
   /* FTP transfer mode, CURLFTPMODE_STREAM or CURLFTPMODE_BLOCK */
   CURLOPT(CURLOPT_FTP_TRANSFER_MODE, CURLOPTTYPE_VALUES, 333),
 
+  /* FTPMC: number of parallel FTP data connections, 0 to disable */
+  CURLOPT(CURLOPT_FTP_MC_CONNECTIONS, CURLOPTTYPE_LONG, 334),
+
+  /* FTPMC: stripe size in bytes, 0 for the server's */
+  CURLOPT(CURLOPT_FTP_MC_STRIPE, CURLOPTTYPE_LONG, 335),
+
   CURLOPT_LASTENTRY /* the last unused */
 } CURLoption;
 
@@ -3036,7 +3042,8 @@ typedef enum {
   CURLINFO_PROXYAUTH_USED   = CURLINFO_LONG + 70,
   CURLINFO_SIZE_DELIVERED   = CURLINFO_OFF_T + 71,
   CURLINFO_FTP_TRANSFER_MODE = CURLINFO_LONG + 72,
-  CURLINFO_LASTONE          = 72
+  CURLINFO_FTP_MC_CONNECTIONS = CURLINFO_LONG + 73,
+  CURLINFO_LASTONE          = 73
 } CURLINFO;
 
 /* CURLINFO_RESPONSE_CODE is the new name for the option previously known as

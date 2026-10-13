@@ -180,6 +180,8 @@ struct OperationConfig {
   long timeout_ms;
   long connecttimeout_ms;
   long maxredirs;
+  long ftp_mc;          /* --ftp-mc, FTPMC data connections */
+  curl_off_t ftp_mc_stripe; /* --ftp-mc-stripe */
   long httpversion;
   unsigned long socks5_auth;/* auth bitmask for socks5 proxies */
   long req_retry;           /* number of retries */

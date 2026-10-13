@@ -1117,6 +1117,19 @@ static CURLcode setopt_long_proto(struct Curl_easy *data, CURLoption option,
     else
       s->ftp_transfer_mode = (unsigned char)arg;
     break;
+  case CURLOPT_FTP_MC_CONNECTIONS:
+    if((arg < 0) || (arg > CURL_FTP_MC_MAX_CONNECTIONS))
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+    else
+      s->ftp_mc_conns = (uint8_t)arg;
+    break;
+  case CURLOPT_FTP_MC_STRIPE:
+    /* the draft allows 1 to 4294967295 */
+    if((arg < 0) || ((unsigned long)arg > 0xffffffffUL))
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+    else
+      s->ftp_mc_stripe = (uint32_t)arg;
+    break;
   case CURLOPT_FTPSSLAUTH:
     if((arg < CURLFTPAUTH_DEFAULT) || (arg >= CURLFTPAUTH_LAST))
       result = CURLE_BAD_FUNCTION_ARGUMENT;
